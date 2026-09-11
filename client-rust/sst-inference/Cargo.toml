@@ -1,0 +1,8 @@
+[package]
+name = "sst-inference"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lib-rust = {path = "../lib-rust"}
+cpal = {version = "0.18.1" , features =["realtime"]}

@@ -1,0 +1,8 @@
+[package]
+name = "inference"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+lib-rust = {path = "../lib-rust"}

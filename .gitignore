@@ -1,0 +1,4 @@
+/cmake-build-debug/
+/client-rust/target/
+/build/
+/vendor/test-image-create/build/

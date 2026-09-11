@@ -1,0 +1,3 @@
+[workspace]
+members = ["inference","lib-rust", "sst-inference"]
+resolver = "3"
