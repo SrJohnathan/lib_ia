@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-
 #include <map>
 #include <memory>
 #include <mutex>
@@ -663,14 +662,21 @@ static bool generate_text(
             // B. Popular batch respeitando posições M-RoPE
             common_batch_clear(batch);
 
-            if (draft.empty()) {
-                // Sem rascunho: decodifica apenas o id_last na posição atual
-                common_batch_add(batch, id_last, n_past, { 0 }, true);
-            } else {
-                // Com rascunho: insere a sequência do rascunho a partir de n_past
-                for (size_t i = 0; i < draft.size(); ++i) {
-                    common_batch_add(batch, draft[i], n_past + i, { 0 }, true);
-                }
+            // Como ctx_dft == ctx_tgt (MTP de modelo único, mesmo KV cache compartilhado),
+            // o common_speculative_draft() acima já decodificou internamente o id_last na
+            // posição n_past e tokens de máscara em n_past+1..n_past+n_draft, avançando o
+            // cache real. Isso precisa ser desfeito antes de decodificar de novo pra
+            // verificação, senão a checagem de M-RoPE rejeita (X < Y violado).
+            if (rt->spec) {
+                llama_memory_seq_rm(llama_get_memory(rt->init->context()), 0, n_past, -1);
+            }
+
+            // Sempre inclui id_last na verificação — quando há draft, os tokens de draft[]
+            // são as previsões para n_past+1, n_past+2, ..., então ficam deslocados +1 em
+            // relação ao id_last (que ocupa n_past).
+            common_batch_add(batch, id_last, n_past, { 0 }, true);
+            for (size_t i = 0; i < draft.size(); ++i) {
+                common_batch_add(batch, draft[i], n_past + 1 + i, { 0 }, true);
             }
 
             // C. Avaliar no modelo alvo
