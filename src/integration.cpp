@@ -882,7 +882,8 @@ bool libia_params_set_tools_json(libia_params *params, const char *tools_json, c
 
     try {
         auto parsed = nlohmann::ordered_json::parse(raw);
-        impl->tools = common_chat_tools_parse_oaicompat(parsed);
+        common_json j = common_json::parse(parsed.dump());
+        impl->tools = common_chat_tools_parse_oaicompat(j);
         impl->values["__tools_json"] = raw;
         return true;
     } catch (const std::exception &ex) {

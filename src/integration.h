@@ -1,5 +1,5 @@
 #pragma once
-
+#include <iostream>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -202,6 +202,10 @@ LIBIA_API bool libia_sst_set_vad_samples_overlap(libia_sst *sst, double value, c
 LIBIA_API char *libia_sst_push_audio(libia_sst *sst, const float *samples, size_t n_samples, int64_t sample_rate, int64_t channels, bool finalize, libia_sst_stream_callback on_text, void *user_data, char **error_out);
 LIBIA_API char *libia_sst_flush(libia_sst *sst, libia_sst_stream_callback on_text, void *user_data, char **error_out);
 LIBIA_API const char *libia_sst_last_error(const libia_sst *sst);
+
+LIBIA_API void libia_runtime_set_keep_context(libia_runtime *runtime, bool keep);
+LIBIA_API bool libia_runtime_get_keep_context(const libia_runtime *runtime);
+LIBIA_API void libia_runtime_clear_context(libia_runtime *runtime);   // força limpar
 
 typedef enum libia_image_sample_method {
     LIBIA_IMAGE_SAMPLE_EULER = 0,
