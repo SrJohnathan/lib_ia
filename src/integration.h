@@ -161,7 +161,7 @@ LIBIA_API char *libia_runtime_generate_chat(libia_runtime *runtime, const libia_
 LIBIA_API char *libia_runtime_generate_chat_stream(libia_runtime *runtime, const libia_chat_message *messages, size_t n_messages, int64_t n_predict_override, libia_stream_callback on_text, void *user_data, char **error_out);
 LIBIA_API int64_t        libia_runtime_last_context_tokens(const libia_runtime *runtime);
 LIBIA_API int64_t        libia_runtime_last_generated_tokens(const libia_runtime *runtime);
-LIBIA_API int32_t        libia_runtime_last_tokens_per_second(const libia_runtime *runtime);
+LIBIA_API double        libia_runtime_last_tokens_per_second(const libia_runtime *runtime);
 
 LIBIA_API char *libia_runtime_tokenize_text(libia_runtime *runtime, const char *text, bool add_special, bool parse_special, char **error_out);
 LIBIA_API char *libia_runtime_detokenize_csv(libia_runtime *runtime, const char *tokens_csv, bool special, char **error_out);

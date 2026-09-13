@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <string>
 
@@ -18,7 +19,7 @@ namespace {
                 << "Defaults:\n"
                 << "  --model  /run/media/johnathan/Novo volume/Qwen3.8-27B-MTP-Q4_K_M.gguf\n"
                 << "  --prompt \"O que e Rust language?\"\n"
-                << "  --ngl    0 (CPU only)\n";
+                << "  --ngl    999 (maximo, todas as camadas na GPU)\n";
     }
 
     static void stream_stdout(libia_generation_kind, const char *text, int32_t, int32_t, void *) {
@@ -33,8 +34,8 @@ int main(int argc, char **argv) {
     // std::freopen("/dev/null", "w", stderr);
 
     std::string model_path = "/run/media/johnathan/Novo volume/Qwen3.8-27B-MTP-Q4_K_M.gguf";
-    std::string prompt = "O que e Rust language?";
-    int64_t ngl = 20; // começa seguro (CPU)
+    std::string prompt = "Ola!, Boa tarde";
+    int64_t ngl = 999; // maximo (llama.cpp limita ao numero de camadas do modelo)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i] ? argv[i] : "";
@@ -120,8 +121,7 @@ int main(int argc, char **argv) {
                   << " err=" << (apply_bs_err.value ? apply_bs_err.value : "-") << "\n";
     }
 
-    // --- perf igual ao server ---
-    libia_params_set_bool(params, "flash-attn", true, nullptr);
+    // --- perf igual ao server (log-disable e cache types mantidos) ---
     libia_params_set_bool(params, "log-disable", false, nullptr);
     libia_params_set_string(params, "cache-type-k", "q4_0", nullptr);
     libia_params_set_string(params, "cache-type-v", "q4_0", nullptr);
@@ -151,7 +151,10 @@ int main(int argc, char **argv) {
     std::cerr << "[debug] has_option(spec-draft-n-max) = " << libia_params_has_option(params, "spec-draft-n-max") << "\n";
 
     error_ptr spec_err, draft_err;
-    bool ok1 = libia_params_set_string(params, "spec-type", "draft-mtp", &spec_err.value);
+    const char *libia_spec_env = std::getenv("LIBIA_SPEC");
+    bool disable_spec = libia_spec_env && std::string(libia_spec_env) == "0";
+    std::string spec_type = disable_spec ? "none" : "draft-mtp";
+    bool ok1 = libia_params_set_string(params, "spec-type", spec_type.c_str(), &spec_err.value);
     bool ok2 = libia_params_set_int(params, "spec-draft-n-max", 2, &draft_err.value);
     std::cerr << "spec-type: " << ok1 << " (" << (spec_err.value ? spec_err.value : "-") << ")\n";
     std::cerr << "spec-draft-n-max: " << ok2 << " (" << (draft_err.value ? draft_err.value : "-") << ")\n";
@@ -166,11 +169,15 @@ int main(int argc, char **argv) {
 
     libia_params_set_n_ctx(params, 8192, nullptr);
     libia_params_set_n_batch(params, 512, nullptr);
-    libia_params_set_n_ubatch(params, 256, nullptr); // se voltar o erro X<Y, troca pra 512
+    const char *ub_env = std::getenv("LIBIA_UB");
+    libia_params_set_n_ubatch(params, ub_env ? std::atol(ub_env) : 512, nullptr);
+    const char *fa_env = std::getenv("LIBIA_FA");
+    libia_params_set_bool(params, "flash-attn", fa_env ? std::string(fa_env) == "1" : true, nullptr);
 
     libia_params_set_n_predict(params, 1536, nullptr);
 
-    libia_params_set_temp(params, 0.8, nullptr);
+    const char *temp_env = std::getenv("LIBIA_TEMP");
+    libia_params_set_temp(params, temp_env ? std::atof(temp_env) : 1, nullptr);
     libia_params_set_top_p(params, 0.95, nullptr);
     libia_params_set_top_k(params, 20, nullptr);
 
@@ -212,7 +219,8 @@ int main(int argc, char **argv) {
 
     std::cout << "\n\n--- done ---\n";
     std::cout << "tokens generated : " << libia_runtime_last_generated_tokens(runtime) << "\n";
-    std::cout << "tokens/s         : " << libia_runtime_last_tokens_per_second(runtime) << "\n";
+    std::cout << std::fixed << std::setprecision(1)
+              << "tokens/s         : " << libia_runtime_last_tokens_per_second(runtime) << "\n";
 
     libia_string_free(output);
     libia_runtime_free(runtime);
