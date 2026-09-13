@@ -713,7 +713,12 @@ static bool generate_text(
             const int64_t n_past_new = n_past + n_accepted;
 
             // E. Remover tokens descartados além de n_past_new no KV Cache
-            llama_memory_seq_rm(llama_get_memory(rt->init->context()), 0, n_past_new, -1);
+            int n_rejected = draft.size() - n_accepted;
+            if (n_rejected > 0) {
+                llama_memory_seq_rm(llama_get_memory(rt->init->context()), 0, n_past_new, n_past_new + n_rejected);
+            }
+
+
             if (rt->params.params.speculative.draft.ctx_dft) {
                 llama_memory_seq_rm(llama_get_memory(rt->params.params.speculative.draft.ctx_dft), 0, n_past_new, -1);
             }
