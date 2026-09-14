@@ -20,6 +20,24 @@ pub struct ConfigAgent {
     /// Ferramentas do agente: `Some` habilita o loop de tools (mesmo executor
     /// compartilhado); `None` responde em um unico round.
     pub tools_json: Option<String>,
+    /// Quando `true`, uma rodada que termina sem chamada de ferramenta e
+    /// tratada como falha: tenta-se extrair o tool call do texto (fallback
+    /// JSON) e, se nao houver, aplica-se um empurrao ("chame a ferramenta
+    /// agora"). Mantem acoes como `create_agent` independentes da vontade do
+    /// modelo de narrar em vez de agir.
+    pub force_tools: bool,
+}
+
+impl Default for ConfigAgent {
+    fn default() -> Self {
+        Self {
+            agent_id: String::new(),
+            role: AgentRole::Root,
+            prompt: String::new(),
+            tools_json: None,
+            force_tools: false,
+        }
+    }
 }
 
 /// Estado vivo de um agente registrado na fila: config + historico proprio +

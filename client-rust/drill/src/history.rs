@@ -52,21 +52,24 @@ async fn write_row(db_dir: &PathBuf, row: &HistoryRow) -> Result<(), String> {
         .await
         .map_err(|err| err.to_string())?;
 
-    let table = match db.open_table("historico").execute().await {
-        Ok(table) => table,
-        Err(_) => db
-            .create_table("historico", vec![batch.clone()])
-            .execute()
-            .await
-            .map_err(|err| err.to_string())?,
-    };
-
-    table
-        .add(vec![batch])
-        .execute()
-        .await
-        .map_err(|err| err.to_string())
-        .map(|_| ())
+    match db.open_table("historico").execute().await {
+        Ok(table) => {
+            table
+                .add(vec![batch])
+                .execute()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(_) => {
+            // tabela ainda não existe: create já insere o batch
+            db.create_table("historico", vec![batch])
+                .execute()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(()) // ← sucesso, não devolver o erro do open
+        }
+    }
 }
 
 fn now_f64() -> f64 {

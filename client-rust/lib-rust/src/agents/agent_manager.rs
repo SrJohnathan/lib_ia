@@ -3,6 +3,7 @@ use crate::agents::agent::{
 };
 use crate::runtime::RuntimeLlama;
 use crate::traits::{ChatMessage, GenerationType, ToolCall};
+use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -291,8 +292,20 @@ impl AgentManager {
             reasoning_content: None,
         });
 
-        let use_tools = state.config.tools_json.is_some();
-        let limit = if use_tools { max_tool_rounds } else { 1 };
+        let use_tools_any = state.config.tools_json.is_some();
+        // Modo forcado reserva UMA rodada final sem tools para a resposta ao
+        // usuario: garante conclusao mesmo se o modelo insistir em ferramentas.
+        let limit = if use_tools_any {
+            if state.config.force_tools {
+                max_tool_rounds + 1
+            } else {
+                max_tool_rounds
+            }
+        } else {
+            1
+        };
+        let mut nudges = 0;
+        let mut any_tool_executed = false;
 
         let emit = |event: ManagerEvent| {
             if stream_events {
@@ -306,6 +319,8 @@ impl AgentManager {
         let mut finished = false;
 
         for round in 0..limit {
+            let use_tools = use_tools_any
+                && (!state.config.force_tools || round + 1 < limit);
             emit(ManagerEvent::Status(format!("generating ({})", round + 1)));
 
             let mut calls: Vec<ToolCall> = Vec::new();
@@ -353,6 +368,19 @@ impl AgentManager {
                 },
             });
 
+            // Fallback: o modelo escreveu o tool call como texto (bloco
+            // `<tool_call>`/```json) em vez de emiti-lo nativamente. Recupera
+            // a chamada para nao depender da vontade do modelo.
+            if calls.is_empty() {
+                if let Some(parsed) = parse_tool_json(&output) {
+                    emit(ManagerEvent::Status(format!(
+                        "tool call via fallback JSON: {}",
+                        parsed.name
+                    )));
+                    calls.push(parsed);
+                }
+            }
+
             if interrupt.swap(false, Ordering::Relaxed) {
                 reply = output;
                 finished = true;
@@ -361,6 +389,33 @@ impl AgentManager {
             }
 
             if !use_tools || calls.is_empty() {
+                // Modo forcado: uma rodada que prometeu acao mas nao emitiu
+                // ferramenta merece um empurrao em vez de encerrar a prosa.
+                if use_tools
+                    && state.config.force_tools
+                    && !any_tool_executed
+                    && round + 1 < limit
+                    && nudges < 2
+                {
+                    nudges += 1;
+                    emit(ManagerEvent::Status(format!(
+                        "sem tool call em {}; forcando (round {})",
+                        state.config.agent_id,
+                        round + 2
+                    )));
+                    state.history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: "\nATENCAO: a sua resposta anterior NAO executou nenhuma ferramenta. \
+                                  Se a tarefa do usuario exige uma ferramenta, essa acao NAO foi feita \
+                                  e voce NAO deve reportar como feita. Chame AGORA a ferramenta \
+                                  apropriada com os argumentos completos. Se a tarefa nao requer \
+                                  ferramenta, responda a pergunta do usuario diretamente, sem falar \
+                                  em ferramentas."
+                            .to_string(),
+                        reasoning_content: None,
+                    });
+                    continue;
+                }
                 reply = output;
                 finished = true;
                 emit(ManagerEvent::Status("done".to_string()));
@@ -386,6 +441,7 @@ impl AgentManager {
                     reasoning_content: None,
                 });
             }
+            any_tool_executed = true;
         }
 
         if !finished {
@@ -421,6 +477,105 @@ impl AgentManager {
             context_tokens,
         })
     }
+}
+
+/// Extrai um tool call escrito como texto da resposta do assistente quando
+/// o parsing nativo (llama.cpp/mtmd) nao classificou a chamada. Suporta:
+/// - bloco Qwen `<tool_call> {...} </tool_call>`, incluindo `{"type":"function",...}`
+/// - bloco de codigo ```json ``` com `{"name": ..., "arguments": {...}}`
+/// - JSON simples puro `{"name": ..., "args": {...}}`
+fn parse_tool_json(content: &str) -> Option<ToolCall> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    let mut rest = content;
+    while let Some(start) = rest.find("<tool_call>") {
+        let body = &rest[start + "<tool_call>".len()..];
+        match body.find("</tool_call>") {
+            Some(end) => {
+                candidates.push(body[..end].trim().to_string());
+                rest = &body[end + "</tool_call>".len()..];
+            }
+            None => break,
+        }
+    }
+
+    for start in content.match_indices("```json") {
+        let after = &content[start.0 + "```json".len()..];
+        if let Some(end) = after.find("```") {
+            candidates.push(after[..end].trim().to_string());
+        }
+    }
+
+    for cand in candidates {
+        if let Ok(value) = serde_json::from_str::<Value>(&cand) {
+            if let Some(call) = tool_call_from_value(&value) {
+                return Some(call);
+            }
+        }
+        // Pode haver texto na frente/atras do JSON dentro do bloco.
+        if let Some(brace) = cand.find('{') {
+            if let Some(close) = cand.rfind('}') {
+                if let Ok(value) = serde_json::from_str::<Value>(&cand[brace..=close]) {
+                    if let Some(call) = tool_call_from_value(&value) {
+                        return Some(call);
+                    }
+                }
+            }
+        }
+    }
+
+    // JSON simples sem fence: `{"name": "...", "arguments": {...}}` solto.
+    if let Some(brace) = content.find('{') {
+        if let Some(close) = content.rfind('}') {
+            if let Ok(value) = serde_json::from_str::<Value>(&content[brace..=close]) {
+                if let Some(call) = tool_call_from_value(&value) {
+                    return Some(call);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn tool_call_from_value(value: &Value) -> Option<ToolCall> {
+    let obj = value.as_object()?;
+    let (name, args) = if let Some(fun) = obj.get("function").and_then(Value::as_object) {
+        let name = fun.get("name").and_then(Value::as_str)?;
+        let args = fun
+            .get("arguments")
+            .or_else(|| fun.get("args"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        (name.to_string(), args)
+    } else {
+        let name = obj
+            .get("name")
+            .or_else(|| obj.get("function_name"))
+            .and_then(Value::as_str)?;
+        if name.is_empty() {
+            return None;
+        }
+        let args = obj
+            .get("arguments")
+            .or_else(|| obj.get("args"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        (name.to_string(), args)
+    };
+
+    let call_id = obj
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("fallback_{}", name));
+
+    Some(ToolCall {
+        call_id,
+        command: name.clone(),
+        name,
+        args,
+    })
 }
 
 impl Default for AgentManager {

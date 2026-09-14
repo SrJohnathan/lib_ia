@@ -111,18 +111,18 @@ pub const TOOLS_JSON: &str = r#"[
     "type": "function",
     "function": {
       "name": "create_agent",
-      "description": "Create a new subagent and save it as ~/.drill/agents/drill.<name>.agent.json.",
+      "description": "Create a new subagent and save it as ~/.drill/agents/drill.<name>.agent.json. Only 'name' is required; persona is optional and auto-generated from name+description when omitted.",
       "parameters": {
         "type": "object",
         "properties": {
           "name": { "type": "string", "description": "unique agent name, alphanumeric plus _ - ." },
           "description": { "type": "string", "description": "what this agent is specialized in" },
-          "persona": { "type": "string", "description": "system prompt/persona of the subagent" },
+          "persona": { "type": "string", "description": "system prompt/persona of the subagent (optional)" },
           "temp": { "type": "number", "description": "sampling temperature (default 0.6)" },
           "max_tool_rounds": { "type": "integer", "description": "max tool rounds (default 4)" },
           "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "tools this agent may use" }
         },
-        "required": ["name", "persona"]
+        "required": ["name"]
       }
     }
   },

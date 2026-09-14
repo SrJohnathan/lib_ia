@@ -34,12 +34,14 @@ fn main() {
         role: AgentRole::Agent,
         prompt: "Voce e um assistente de codigo conciso. Responda em portugues, no maximo 3 linhas.".to_string(),
         tools_json: None,
+        force_tools: false,
     });
     manager.add(ConfigAgent {
         agent_id: "poeta".to_string(),
         role: AgentRole::Agent,
         prompt: "Voce e um poeta. Responda apenas com um pequeno poema de 4 versos, em portugues.".to_string(),
         tools_json: None,
+        force_tools: false,
     });
 
     manager.run(Arc::new(Mutex::new(build_engine())));

@@ -77,6 +77,7 @@ impl SubagentConfig {
             role: AgentRole::Agent,
             prompt: self.persona.clone(),
             tools_json: tools_json_for(&self.allowed_tools),
+            force_tools: false,
         }
     }
 }

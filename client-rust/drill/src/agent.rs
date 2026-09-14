@@ -83,6 +83,8 @@ impl Agent {
             role: AgentRole::Root,
             prompt: persona.clone(),
             tools_json: tools_enabled.then(|| tools::TOOLS_JSON.to_string()),
+            // Solo (modo padrao): nao forca tools; apenas agents/maestro.
+            force_tools: false,
         });
         for cfg in subagents::discover_agents(&project_dir) {
             manager.add(cfg.to_config());
@@ -128,6 +130,7 @@ impl Agent {
                 role: AgentRole::Root,
                 prompt,
                 tools_json: self.tools_enabled.then(|| tools::TOOLS_JSON.to_string()),
+                force_tools: self.tools_enabled && mode == Mode::Agents,
             });
         }
     }
@@ -193,6 +196,12 @@ fn maestro_prompt() -> String {
          depende de outro, espere o resultado antes de delegar o seguinte.\n\
          4. Ao final, agregue os RESUMOS de todos e responda ao usuario com uma secao \
          final chamada 'RESUMO GERAL' listando por agente o que foi feito, decisoes e proximo passo.\n\n\
+         REGRAS DE ACao:\n\
+         - Sempre que a tarefa exigir ferramenta, EMITA a chamada de ferramenta imediatamente, \
+         sem texto narrativo antes (nao escreva 'vou fazer x' e pare).\n\
+         - Ao criar um subagente, chame create_agent com name, description e persona completos \
+         logo na primeira rodada.\n\
+         - Responda apenas ao final, agregando os resultados.\n\n\
          Mantenha as respostas concisas em portugues. {}\n",
         subagents::agents_root().display()
     )
@@ -247,8 +256,18 @@ fn maestro_dispatch(
         }
         "create_agent" => {
             let name = arg_str("name").ok_or("missing 'name'")?;
-            let persona = arg_str("persona").ok_or("missing 'persona'")?;
             let description = arg_str("description").unwrap_or_default();
+            // Persona opcional: o JSON obrigatorio pequeno (so o nome) e muito
+            // mais provavel de ser completado pelo modelo do que um prompt
+            // grande embutido na chamada.
+            let persona =
+                arg_str("persona").filter(|p| !p.is_empty()).unwrap_or_else(|| {
+                    if description.is_empty() {
+                        format!("Voce e o agente {} do time do drill. Responda de forma concisa e objetiva, em portugues.", name)
+                    } else {
+                        format!("Voce e o agente {}, especialista em {}. Responda de forma concisa e objetiva, em portugues.", name, description)
+                    }
+                });
             let temp = arg_f32("temp").unwrap_or(0.6);
             let max_tool_rounds = arg_i64("max_tool_rounds")
                 .map(|v| v.max(1) as usize)

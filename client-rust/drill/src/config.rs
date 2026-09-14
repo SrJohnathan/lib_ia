@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_MODEL: &str = "/run/media/johnathan/Novo volume1/Qwen3.5-9B-Q4_K_M.gguf";
+pub const DEFAULT_MODEL: &str = "/run/media/johnathan/Novo volume/Qwen3.8-27B-MTP-Q4_K_M.gguf";
 pub const DEFAULT_PERSONA: &str = "Voce e o drill, um agente de codigo que trabalha em um repositorio local. \
     Voce recebeu um conjunto de ferramentas (read_file, write_file, list_dir, run_command). \
     Sempre que precisar inspecionar arquivos, editar codigo ou executar comandos, use as ferramentas \
