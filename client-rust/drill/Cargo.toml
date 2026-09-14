@@ -14,3 +14,7 @@ serde_json = "1"
 lib-rust = {path = "../lib-rust"}
 syntect = "5.3.0"
 similar = "3.2.0"
+
+lancedb = { version = "0.38.0", features = ["remote"] }
+arrow-array = "58.4.0"
+futures = "0.3"

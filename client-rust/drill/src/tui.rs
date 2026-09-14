@@ -89,6 +89,7 @@ pub enum UiEvent {
     Stats { tokens: i64, tps: f64 },
     ContextUsage { used: usize, max: usize },
     ModeChanged(crate::agent::Mode),
+    AgentWorking(String),
     Err(String),
     Done,
 }
@@ -108,6 +109,7 @@ pub struct AppState {
     pub interrupt: Arc<AtomicBool>,
     pub highlighter: CodeHighlighter,
     pub mode: crate::agent::Mode,
+    pub working_agent: Option<String>,
 }
 
 impl AppState {
@@ -127,6 +129,7 @@ impl AppState {
             interrupt,
             highlighter: CodeHighlighter::new(),
             mode: crate::agent::Mode::Solo,
+            working_agent: None,
         }
     }
 
@@ -183,6 +186,20 @@ impl AppState {
             UiEvent::ModeChanged(mode) => {
                 self.mode = mode;
             }
+            UiEvent::AgentWorking(name) => {
+                if name == "drill" {
+                    if self.mode == crate::agent::Mode::Agents {
+                        self.working_agent = Some("maestro".to_string());
+                        self.status = "trabalhando: maestro".to_string();
+                    } else {
+                        self.working_agent = Some("drill".to_string());
+                        self.status = "trabalhando: drill".to_string();
+                    }
+                } else {
+                    self.working_agent = Some(name.clone());
+                    self.status = format!("trabalhando: {}", name);
+                }
+            }
             UiEvent::Err(text) => {
                 self.push(Kind::Err, format!("error: {}", text));
                 self.status = "error".to_string();
@@ -190,6 +207,7 @@ impl AppState {
             UiEvent::Done => {
                 self.gen_active = false;
                 self.interrupt.store(false, Ordering::Relaxed);
+                self.working_agent = None;
                 self.status = "ready".to_string();
             }
         }
@@ -645,7 +663,53 @@ fn draw_right_panel(frame: &mut Frame, state: &AppState, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Tools", Style::default().fg(COLOR_TEXT_MAIN).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(if s.tools_enabled { "enabled" } else { "disabled" }, Style::default().fg(if s.tools_enabled { Color::Green } else { COLOR_TEXT_MUTED }))),
+        Line::from(""),
+        Line::from(Span::styled("Equipe", Style::default().fg(COLOR_TEXT_MAIN).add_modifier(Modifier::BOLD))),
     ];
+
+    let root_label = if state.mode == crate::agent::Mode::Agents {
+        "maestro".to_string()
+    } else {
+        "drill (solo)".to_string()
+    };
+    let root_active = state.working_agent.as_deref() == Some(root_label.as_str());
+    lines.push(Line::from(vec![
+        Span::styled(
+            if root_active { "● " } else { "  " },
+            Style::default().fg(if root_active { Color::Cyan } else { COLOR_BORDER }).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            root_label.clone(),
+            Style::default().fg(if root_active { COLOR_ACCENT } else { COLOR_TEXT_MUTED }).add_modifier(if root_active { Modifier::BOLD } else { Modifier::empty() }),
+        ),
+    ]));
+
+    let team: Vec<String> = crate::subagents::discover_agents(std::path::Path::new(&s.project_dir))
+        .into_iter()
+        .map(|cfg| cfg.name)
+        .collect();
+    if team.is_empty() {
+        lines.push(Line::from(Span::styled("(nenhum subagente)", Style::default().fg(COLOR_TEXT_MUTED))));
+    } else {
+        for name in &team {
+            let active = state.working_agent.as_deref() == Some(name.as_str());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if active { "● " } else { "  " },
+                    Style::default().fg(if active { Color::Cyan } else { COLOR_BORDER }).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    name.clone(),
+                    Style::default().fg(if active { COLOR_ACCENT } else { COLOR_TEXT_MUTED }).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+                if active {
+                    Span::styled(" (trabalhando)", Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC))
+                } else {
+                    Span::styled("", Style::default())
+                },
+            ]));
+        }
+    }
 
     if !state.queue.is_empty() {
         lines.push(Line::from(""));

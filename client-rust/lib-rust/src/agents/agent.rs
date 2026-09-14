@@ -1,11 +1,9 @@
 use crate::traits::ChatMessage;
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
 
 /// Papel do agente dentro do time.
-/// - `Root`: o agente principal (ex.: drill/maestro), único com acesso ao
-///   loop de ferramentas disparado pela fila.
-/// - `Agent`: subagente delegado via `ask_agent`; responde em um turno unico.
+/// - `Root`: o agente principal (ex.: drill/maestro).
+/// - `Agent`: subagente delegado via `ask_agent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
     Root,
@@ -16,56 +14,78 @@ pub enum AgentRole {
 pub struct ConfigAgent {
     pub agent_id: String,
     pub role: AgentRole,
-    /// Persona do agente, enviada como primeira mensagem do tipo "system" no proprio historico
-    /// (nao altera o system_prompt global do RuntimeLlama).
+    /// Persona do agente, enviada como primeira mensagem do tipo "system" no
+    /// proprio historico (nao altera o system_prompt global do RuntimeLlama).
     pub prompt: String,
-    /// Ferramentas do agente (reservado para uso futuro; o RuntimeLlama nao e alterado).
+    /// Ferramentas do agente: `Some` habilita o loop de tools (mesmo executor
+    /// compartilhado); `None` responde em um unico round.
     pub tools_json: Option<String>,
 }
 
-pub struct AgentTask {
-    pub agent_id: String,
-    pub input_prompt: String,
-    pub reply_sender: Sender<std::result::Result<String, String>>,
-}
-
-#[derive(Clone)]
-pub struct Agent {
+/// Estado vivo de um agente registrado na fila: config + historico proprio +
+/// resumo do ultimo trabalho concluido.
+#[derive(Debug, Clone)]
+pub struct AgentState {
     pub config: ConfigAgent,
-    pub(crate) history: Arc<Mutex<Vec<ChatMessage>>>,
-    queue_tx: Sender<AgentTask>,
+    pub history: Vec<ChatMessage>,
+    /// Resumo do ultimo trabalho do agente (gerado por relexão em
+    /// `run_inline_with_summary`). Usado para historico/UI.
+    pub summary: Option<String>,
 }
 
-impl Agent {
-    pub fn new(config: ConfigAgent, queue_tx: Sender<AgentTask>) -> Self {
+impl AgentState {
+    pub fn new(config: ConfigAgent) -> Self {
         Self {
             config,
-            history: Arc::new(Mutex::new(Vec::new())),
-            queue_tx,
+            history: Vec::new(),
+            summary: None,
         }
     }
+}
 
-    /// Envia uma tarefa para a fila do Manager e bloqueia aguardando a resposta.
-    /// O Manager e o unico escritor do historico (adiciona a mensagem do usuario
-    /// e a resposta do assistente), garantindo uma unica chamada ao RuntimeLlama por task.
-    pub fn execute(&self, input_prompt: &str) -> std::result::Result<String, String> {
-        let (tx, rx) = channel();
-        let task = AgentTask {
-            agent_id: self.config.agent_id.clone(),
-            input_prompt: input_prompt.to_string(),
-            reply_sender: tx,
-        };
+/// Linha de historico persistente gerada ao final de cada turno. O `kind`
+/// indica a natureza do registro: "root" (turno do usuario no drill/maestro),
+/// "main" (trabalho de um subagente) ou "resumo" (resumo reflexivo do agente).
+/// E entregue ao listener registrado via `AgentManager::set_history`.
+#[derive(Debug, Clone)]
+pub struct HistoryRow {
+    pub agent_id: String,
+    pub kind: String,
+    pub input: String,
+    pub reply: String,
+    pub tokens: Option<i64>,
+    pub tps: Option<f64>,
+    pub context_tokens: Option<i64>,
+}
 
-        self.queue_tx.send(task).map_err(|e| e.to_string())?;
-        rx.recv().map_err(|e| e.to_string())?
-    }
+/// Resultado de um turno. Stats sao lidos na MESMA thread que gerou
+/// (dentro de `run_turn_unified`) e devolvidos aqui; quem consumiu a fila
+/// nunca volta ao engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnResult {
+    pub reply: String,
+    pub tokens: Option<i64>,
+    pub tps: Option<f64>,
+    pub context_tokens: Option<i64>,
+}
 
-    /// Copia do historico de tokens do agente (persona + turnos anteriores).
-    pub fn history(&self) -> Vec<ChatMessage> {
-        self.history.lock().unwrap().clone()
-    }
+/// Task enfileirada no AgentManager (um turno de um agente).
+pub struct AgentTask {
+    pub agent_id: String,
+    pub input: String,
+    pub reply: Sender<Result<TurnResult, String>>,
+}
 
-    pub fn clear_history(&self) {
-        self.history.lock().unwrap().clear();
+impl AgentTask {
+    pub fn new(
+        agent_id: String,
+        input: String,
+        reply: Sender<Result<TurnResult, String>>,
+    ) -> Self {
+        Self {
+            agent_id,
+            input,
+            reply,
+        }
     }
 }

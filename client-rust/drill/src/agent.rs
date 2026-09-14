@@ -1,14 +1,21 @@
+use crate::history::History;
 use crate::subagents::{self, SubagentConfig};
 use crate::tools;
-use lib_rust::agents::{AgentManager, AgentRole, ConfigAgent, EventSink, ToolExecutor};
-use lib_rust::{ChatMessage, GenerationType, RuntimeLlama};
+use lib_rust::agents::{AgentManager, AgentRole, ConfigAgent, EventSink, TurnResult};
+use lib_rust::RuntimeLlama;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 const MAX_TOOL_RESULT: usize = 24_000;
 const MAESTRO_AGENT_ID: &str = "drill";
+
+/// Prompt de reflexão: ao final do trabalho, o agente produz o resumo que é
+/// entregue ao maestro e também vai para o historico (kind = "resumo").
+const SUMMARY_PROMPT: &str = "[drill] Trabalho concluído. Escreva um RESUMO curto \
+     (maximo 4 linhas) do que você fez, arquivos/estado atual e pendencias. \
+     Responda apenas com o resumo.";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -31,22 +38,12 @@ impl Mode {
     }
 }
 
-pub enum AgentEvent {
-    Stream(GenerationType),
-    ToolStart(String),
-    ToolResult(String, String),
-    Status(String),
-}
-
 pub enum WorkerMsg {
     Turn(String),
     SetMode(Mode),
 }
 
-/// Cancela a geração nativa em andamento, de qualquer thread — inclusive da
-/// UI, sem precisar de acesso mutável à instância do Agent/engine que está
-/// bloqueada rodando na thread worker. Chamada ao interromper (Esc) ou
-/// direcionar (Ctrl+Enter).
+/// Cancela a geração nativa em andamento, de qualquer thread.
 pub fn cancel_generation() {
     RuntimeLlama::cancel_all_generations();
 }
@@ -58,68 +55,81 @@ fn is_maestro_tool(name: &str) -> bool {
     MAESTRO_TOOLS.contains(&name)
 }
 
+/// Frente do drill para a fila de agentes. Solo e agentes compartilham o
+/// MESMO caminho de geracao (`AgentManager` == uma thread == RuntimeLlama).
 pub struct Agent {
-    engine: Arc<Mutex<RuntimeLlama>>,
-    history: Vec<ChatMessage>,
-    project_dir: PathBuf,
-    tools_enabled: bool,
-    max_tool_rounds: usize,
+    manager: Arc<AgentManager>,
     ctx_max: usize,
-    interrupt: Arc<AtomicBool>,
-
+    tools_enabled: bool,
     mode: Mode,
-    /// Fila de agentes: o maestro ("drill", role Root) e os subagentes (role
-    /// Agent). No modo agents o turno entra na fila como qualquer outro agente.
-    manager: Arc<Mutex<AgentManager>>,
+    persona: String,
 }
 
 impl Agent {
     pub fn new(
-        engine: Arc<Mutex<RuntimeLlama>>,
+        engine: Arc<std::sync::Mutex<RuntimeLlama>>,
         project_dir: PathBuf,
         tools_enabled: bool,
         ctx_max: usize,
         interrupt: Arc<AtomicBool>,
+        persona: String,
     ) -> Self {
         let mut manager = AgentManager::new();
-        manager.set_interrupt(interrupt.clone());
+        manager.set_interrupt(interrupt);
+        let manager = Arc::new(manager);
+
         manager.add(ConfigAgent {
             agent_id: MAESTRO_AGENT_ID.to_string(),
             role: AgentRole::Root,
-            prompt: maestro_prompt(),
+            prompt: persona.clone(),
             tools_json: tools_enabled.then(|| tools::TOOLS_JSON.to_string()),
         });
         for cfg in subagents::discover_agents(&project_dir) {
             manager.add(cfg.to_config());
         }
 
-        let manager = Arc::new(Mutex::new(manager));
-        manager
-            .lock()
-            .unwrap()
-            .set_executor(make_executor(Arc::clone(&manager), project_dir.clone()));
-        manager.lock().unwrap().run(engine.clone());
+        manager.set_executor(make_executor(Arc::clone(&manager), project_dir));
+        manager.run(engine);
 
         Self {
-            engine,
-            history: Vec::new(),
-            project_dir,
-            tools_enabled,
-            max_tool_rounds: 8,
-            ctx_max,
-            interrupt,
-            mode: Mode::Solo,
             manager,
+            ctx_max,
+            tools_enabled,
+            mode: Mode::Solo,
+            persona,
         }
     }
 
-    /// Direciona os eventos de progresso da fila (modo agents) para a UI.
+    /// Direciona os eventos de progresso da fila (stream/tool/status) para a UI.
     pub fn set_event_sink(&self, sink: EventSink) {
-        self.manager.lock().unwrap().set_event_sink(sink);
+        self.manager.set_event_sink(sink);
     }
 
+    /// Registra o historico persistente (LanceDB): cada turno concluído vira
+    /// uma linha gravada por uma thread separada.
+    pub fn set_history(&self, history: Arc<History>) {
+        self.manager.set_history(Arc::new(move |row| {
+            history.record(row);
+        }));
+    }
+
+    /// Persona/tools do agente "drill" mudam com o modo; o historico do root
+    /// e reiniciado (um root, um contexto por modo).
     pub fn set_mode(&mut self, mode: Mode) {
+        let prev = self.mode;
         self.mode = mode;
+        if prev != mode {
+            let prompt = match mode {
+                Mode::Solo => self.persona.clone(),
+                Mode::Agents => maestro_prompt(),
+            };
+            self.manager.add(ConfigAgent {
+                agent_id: MAESTRO_AGENT_ID.to_string(),
+                role: AgentRole::Root,
+                prompt,
+                tools_json: self.tools_enabled.then(|| tools::TOOLS_JSON.to_string()),
+            });
+        }
     }
 
     pub fn mode(&self) -> Mode {
@@ -130,232 +140,41 @@ impl Agent {
         self.ctx_max
     }
 
-    /// Tokens reais de contexto usados, quando o runtime reportar (pos-generacao).
-    pub fn context_used(&mut self) -> usize {
-        let tokens = {
-            let mut engine = self.engine.lock().unwrap();
-            engine.last_context_tokens()
-        };
-        match tokens {
-            Some(tokens) if tokens > 0 => tokens as usize,
-            _ => self.context_estimate(),
-        }
-    }
-
-    /// Estimativa grosseira de tokens de contexto usados (chars/4).
+    /// Estimativa grosseira de tokens de contexto (chars/4) a partir do
+    /// historico do root — usado apenas como fallback quando o runtime nao
+    /// reporta tokens. Nao toca no engine.
     pub fn context_estimate(&self) -> usize {
         let chars: usize = self
-            .history
-            .iter()
-            .map(|m| {
-                m.content.len()
-                    + m.reasoning_content
-                        .as_deref()
-                        .map(str::len)
-                        .unwrap_or(0)
+            .manager
+            .history_of(MAESTRO_AGENT_ID)
+            .map(|history| {
+                history
+                    .iter()
+                    .map(|m| {
+                        m.content.len()
+                            + m.reasoning_content
+                                .as_deref()
+                                .map(str::len)
+                                .unwrap_or(0)
+                    })
+                    .sum::<usize>()
             })
-            .sum();
+            .unwrap_or(0);
         chars / 4
     }
 
-    pub fn last_stats(&mut self) -> Option<(i64, f64)> {
-        let mut engine = self.engine.lock().unwrap();
-        let tokens = engine.last_generated_tokens()?;
-        let tps = engine.last_tokens_per_second()?;
-        Some((tokens, tps))
-    }
-
-    fn push_user(&mut self, content: String) {
-        self.history.push(ChatMessage {
-            role: "user".to_string(),
-            content,
-            reasoning_content: None,
-        });
-    }
-
-    fn push_assistant(&mut self, content: String, reasoning: Option<String>) {
-        self.history.push(ChatMessage {
-            role: "assistant".to_string(),
-            content,
-            reasoning_content: reasoning,
-        });
-    }
-
-    fn tool_result_block(call: &tools::ToolCall, result: &str) -> String {
-        format!(
-            "\n<tool_result> name={} id={}\n{}\n</tool_result>",
-            call.name, call.call_id, result
-        )
-    }
-
-    pub fn run_turn<F>(&mut self, user_input: &str, on_event: F) -> Result<(), String>
-    where
-        F: FnMut(AgentEvent),
-    {
-        if self.mode == Mode::Agents {
-            return self.run_agent_turn(user_input);
-        }
-        self.run_solo_turn(user_input, on_event)
-    }
-
-    /// Modo agents: o maestro entra na fila do AgentManager como qualquer
-    /// agente. A geracao acontece na thread do manager; os eventos chegam via
-    /// EventSink setado pela UI.
-    fn run_agent_turn(&mut self, user_input: &str) -> Result<(), String> {
-        let agent = {
-            let manager = self.manager.lock().unwrap();
-            manager
-                .get(MAESTRO_AGENT_ID)
-                .ok_or_else(|| "agente raiz nao registrado".to_string())?
-        };
-        agent.execute(user_input).map_err(|err| err)?;
-        Ok(())
-    }
-
-    /// Modo solo: loop direto no engine compartilhado (mesmo runtime da fila).
-    fn run_solo_turn<F>(&mut self, user_input: &str, mut on_event: F) -> Result<(), String>
-    where
-        F: FnMut(AgentEvent),
-    {
-        self.push_user(user_input.to_string());
-
-        if !self.tools_enabled {
-            let _ = self.generate_round(on_event)?;
-            self.interrupt.store(false, Ordering::Relaxed);
-            return Ok(());
-        }
-
-        for round in 0..self.max_tool_rounds {
-            let tool_calls = {
-                let mut cb = on_event;
-                cb(AgentEvent::Status(format!("generating ({})", round + 1)));
-                let calls = self.generate_round(|event| cb(event))?;
-                on_event = cb;
-                calls
-            };
-
-            if self.interrupt.swap(false, Ordering::Relaxed) {
-                on_event(AgentEvent::Status("interrompido".to_string()));
-                return Ok(());
-            }
-
-            if tool_calls.is_empty() {
-                on_event(AgentEvent::Status("done".to_string()));
-                return Ok(());
-            }
-
-            for call in tool_calls {
-                on_event(AgentEvent::ToolStart(call.name.clone()));
-
-                // Ferramentas do maestro sao executadas pelo mesmo executor da
-                // fila (sem spawn separado), usando um snapshot que nao segura
-                // o lock do manager durante a chamada.
-                if is_maestro_tool(&call.name) {
-                    let executor = self.manager.lock().unwrap().executor_snapshot();
-                    let result = match executor {
-                        Some(exec) => exec(&call.name, call.args.clone())
-                            .unwrap_or_else(|err| format!("ERROR: {}", truncate(err, 4_000))),
-                        None => "ERROR: executor de ferramentas indisponivel".to_string(),
-                    };
-                    on_event(AgentEvent::ToolResult(call.name.clone(), result.clone()));
-                    self.push_user(Self::tool_result_block(&call, &result));
-                    continue;
-                }
-
-                let (tx, rx) = std::sync::mpsc::channel();
-                let project_dir = self.project_dir.to_string_lossy().to_string();
-                let call_clone = call.clone();
-
-                std::thread::spawn(move || {
-                    let res = tools::execute(&call_clone, &project_dir);
-                    let _ = tx.send(res);
-                });
-
-                let result = loop {
-                    if self
-                        .interrupt
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        on_event(AgentEvent::Status("interrompido".to_string()));
-                        return Ok(());
-                    }
-                    if let Ok(res) = rx.try_recv() {
-                        break res;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                };
-
-                on_event(AgentEvent::ToolResult(call.name.clone(), result.clone()));
-                self.push_user(Self::tool_result_block(&call, &result));
-            }
-        }
-
-        Err("max tool rounds reached without final answer".to_string())
-    }
-
-    fn generate_round<F>(&mut self, mut on_event: F) -> Result<Vec<tools::ToolCall>, String>
-    where
-        F: FnMut(AgentEvent),
-    {
-        let mut tool_calls: Vec<tools::ToolCall> = Vec::new();
-        let mut reasoning = String::new();
-        let interrupt = self.interrupt.clone();
-
-        let result = {
-            let mut engine = self.engine.lock().unwrap();
-            engine.generate_chat_messages_stream_with(&self.history, |chunk, _, _| {
-                if interrupt.load(Ordering::Relaxed) {
-                    return;
-                }
-                match &chunk {
-                    GenerationType::Content(text) => {
-                        on_event(AgentEvent::Stream(GenerationType::Content(text.clone())));
-                    }
-                    GenerationType::Reasoning(text) => {
-                        reasoning.push_str(text);
-                        on_event(AgentEvent::Stream(GenerationType::Reasoning(text.clone())));
-                    }
-                    GenerationType::CallTool(tool) => {
-                        tool_calls.push(tools::ToolCall {
-                            name: tool.name.clone(),
-                            call_id: tool.call_id.clone(),
-                            args: tool.args.clone(),
-                        });
-                        on_event(AgentEvent::Stream(GenerationType::CallTool(tool.clone())));
-                    }
-                    GenerationType::ToolPreview(_) => {}
-                }
-            })
-        };
-
-        if interrupt.load(Ordering::Relaxed) {
-            if let Ok(output) = result {
-                self.push_assistant(
-                    output,
-                    if reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(reasoning)
-                    },
-                );
-            }
-            return Ok(Vec::new());
-        }
-
-        let output = result.map_err(|err| err.to_string())?;
-        self.push_assistant(
-            output,
-            if reasoning.is_empty() {
-                None
-            } else {
-                Some(reasoning)
-            },
-        );
-        Ok(tool_calls)
+    /// Turno unico para solo e agentes: enfileira no root e espera o
+    /// TurnResult (stats já lidas na thread da geracao).
+    pub fn run_turn(&mut self, user_input: &str) -> Result<TurnResult, String> {
+        self.manager.enqueue(MAESTRO_AGENT_ID, user_input)
     }
 }
 
-/// Persona do maestro: unica mensagem system do historico do Root na fila.
+/// Persona do maestro: mensagem system do historico do Root em modo agents.
+/// As personas nunca vao via system_prompt do engine (o wrapper C++ o
+/// pre-anexa ao historico e um system duplicado estoura excecao nativa),
+/// entao solo (persona base) e agents (maestro) injetam sua persona como
+/// primeira mensagem do historico.
 fn maestro_prompt() -> String {
     format!(
         "[drill:maestro] Você é o agente MAESTRO de um time de IA. \
@@ -364,16 +183,25 @@ fn maestro_prompt() -> String {
          - list_agents: lista os subagentes disponiveis com nome, descricao, ferramentas e temperatura\n\
          - read_agent <name>: exibe o perfil de um subagente\n\
          - create_agent <name, persona, ...>: cria um novo subagente\n\
-         - ask_agent <name, prompt>: delega uma tarefa a um subagente e retorna a resposta\n\n\
-         Ao responder o usuario, delegue o trabalho usando ask_agent e resuma os resultados. \
-         Mantenha respostas concisas em portugues. {}\n",
+         - ask_agent <name, prompt>: delega uma tarefa a um subagente e retorna TRABALHO + RESUMO\n\n\
+         FLUXO DE TRABALHO EM EQUIPE:\n\
+         1. Ao receber um pedido, liste os subagentes (list_agents) e identifique \
+         quais especialistas sao necessarios (ex.: front, back, test).\n\
+         2. Monte um plano e delegue a CADA especialista uma chamada ask_agent com \
+         prompt objetivo, completo e em portugues.\n\
+         3. Cada ask_agent responde com [NOME] TRABALHO e RESUMO. Se um trabalho \
+         depende de outro, espere o resultado antes de delegar o seguinte.\n\
+         4. Ao final, agregue os RESUMOS de todos e responda ao usuario com uma secao \
+         final chamada 'RESUMO GERAL' listando por agente o que foi feito, decisoes e proximo passo.\n\n\
+         Mantenha as respostas concisas em portugues. {}\n",
         subagents::agents_root().display()
     )
 }
 
 /// Executor de ferramentas do time: base (read_file, patch_file, ...) via
-/// tools::execute e ferramentas do maestro resolvidas aqui mesmo.
-fn make_executor(manager: Arc<Mutex<AgentManager>>, project_dir: PathBuf) -> ToolExecutor {
+/// tools::execute e ferramentas do maestro resolvidas aqui mesmo. Corre NA
+/// thread da fila (a mesma do RuntimeLlama).
+fn make_executor(manager: Arc<AgentManager>, project_dir: PathBuf) -> lib_rust::agents::ToolExecutor {
     let project = project_dir.to_string_lossy().to_string();
     Arc::new(move |name: &str, args: Value| -> Result<String, String> {
         if is_maestro_tool(name) {
@@ -389,10 +217,11 @@ fn make_executor(manager: Arc<Mutex<AgentManager>>, project_dir: PathBuf) -> Too
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maestro_dispatch(
     name: &str,
     args: Value,
-    manager: &Arc<Mutex<AgentManager>>,
+    manager: &Arc<AgentManager>,
     project_dir: &Path,
 ) -> Result<String, String> {
     let arg_str = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_string);
@@ -451,8 +280,8 @@ fn maestro_dispatch(
             };
 
             let path = subagents::save_agent(&cfg)?;
-            // Registrar na fila para ask_agent ja encontrar no mesmo turno.
-            manager.lock().unwrap().add(cfg.to_config());
+            // Registrar na fila para ask_agent ja achar no mesmo turno.
+            manager.add(cfg.to_config());
             Ok(format!(
                 "Subagente '{}' criado e salvo em {}.\ndescricao: {}\ntemp: {:.1} | rounds: {} | ferramentas: {}",
                 cfg.name,
@@ -466,12 +295,15 @@ fn maestro_dispatch(
         "ask_agent" => {
             let name = arg_str("name").ok_or("missing 'name'")?;
             let prompt = arg_str("prompt").ok_or("missing 'prompt'")?;
-            let reply = manager.lock().unwrap().execute_now(&name, &prompt)?;
-            Ok(format!("[{}]{}", name, if reply.is_empty() {
-                "(resposta vazia)".to_string()
-            } else {
-                format!("\n{}", reply)
-            }))
+            // Trabalho + resumo, executados NA MESMA THREAD (inline, sem
+            // re-enfileirar). O resumo é a entrega do agente ao maestro.
+            let (work, resumo) = manager
+                .run_inline_with_summary(&name, &prompt, SUMMARY_PROMPT)
+                .map_err(|err| format!("ask_agent falhou: {}", err))?;
+            Ok(format!(
+                "[{}]\nTRABALHO\n{}\nFIN_TRABALHO\nRESUMO\n{}",
+                name, work.reply, resumo.reply
+            ))
         }
         other => Err(format!("unknown maestro tool: {}", other)),
     }

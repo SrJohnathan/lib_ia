@@ -27,7 +27,7 @@ fn build_engine() -> RuntimeLlama {
 }
 
 fn main() {
-    let mut manager = AgentManager::new();
+    let manager = AgentManager::new();
 
     manager.add(ConfigAgent {
         agent_id: "codigo".to_string(),
@@ -44,28 +44,28 @@ fn main() {
 
     manager.run(Arc::new(Mutex::new(build_engine())));
 
-    let codigo = manager.get("codigo").expect("agente codigo");
-    let poeta = manager.get("poeta").expect("agente poeta");
-
-    turn("codigo", &codigo, "Memorize que meu projeto se chama Cronos.");
-    turn("poeta", &poeta, "Faca um verso curto sobre a neve.");
+    turn(&manager, "codigo", "Memorize que meu projeto se chama Cronos.");
+    turn(&manager, "poeta", "Faca um verso curto sobre a neve.");
 
     println!("\n--- segundo turno (testa memoria por agente) ---");
-    turn("codigo", &codigo, "Qual o nome do meu projeto?");
-    turn("poeta", &poeta, "Agora sobre a lua.");
+    turn(&manager, "codigo", "Qual o nome do meu projeto?");
+    turn(&manager, "poeta", "Agora sobre a lua.");
 
     for id in manager.agent_ids() {
-        let agent = manager.get(&id).unwrap();
-        println!("\n[{}] historico: {} mensagens, {} tokens (chars/4 estimados)",
-            id, agent.history().len(),
-            agent.history().iter().map(|m| m.content.len()).sum::<usize>() / 4);
+        let state = manager.get(&id).unwrap();
+        println!(
+            "\n[{}] historico: {} mensagens, {} tokens (chars/4 estimados)",
+            id,
+            state.history.len(),
+            state.history.iter().map(|m| m.content.len()).sum::<usize>() / 4
+        );
     }
 }
 
-fn turn(id: &str, agent: &lib_rust::agents::Agent, prompt: &str) {
+fn turn(manager: &AgentManager, id: &str, prompt: &str) {
     println!("\n>>> [{}] {} \n  {}", id, prompt, "-".repeat(40));
-    match agent.execute(prompt) {
-        Ok(text) => println!("`{}`", text),
+    match manager.enqueue(id, prompt) {
+        Ok(turn) => println!("`{}`\n  (tokens={:?}, tps={:?})", turn.reply, turn.tokens, turn.tps),
         Err(err) => println!("ERRO: {}", err),
     }
 }

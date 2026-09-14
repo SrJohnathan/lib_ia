@@ -1,10 +1,16 @@
+use crate::tools;
 use lib_rust::agents::{AgentRole, ConfigAgent};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const AGENT_FILE_PREFIX: &str = "drill.";
 pub const AGENT_FILE_SUFFIX: &str = ".agent.json";
+
+/// Ferramentas base do time (disponiveis para subagentes). Ferramentas do
+/// maestro (list/read/create/ask_agent) sao exclusivas do drill/maestro.
+const BASE_TOOLS: &[&str] = &["read_file", "write_file", "list_dir", "patch_file", "run_command"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -70,7 +76,7 @@ impl SubagentConfig {
             agent_id: self.name.clone(),
             role: AgentRole::Agent,
             prompt: self.persona.clone(),
-            tools_json: None,
+            tools_json: tools_json_for(&self.allowed_tools),
         }
     }
 }
@@ -160,4 +166,39 @@ pub fn find_agent(name: &str, project_dir: &Path) -> Result<SubagentConfig, Stri
         .into_iter()
         .find(|cfg| cfg.name == name)
         .ok_or_else(|| format!("agente '{}' nao encontrado", name))
+}
+
+/// Monta o JSON de ferramentas de um subagente filtrando `TOOLS_JSON` pelo
+/// `allowed_tools` (vazio = todas as ferramentas base; ferramentas do maestro
+/// nunca sao incluidas). Retorna `None` sem nenhuma ferramenta habilitada
+/// (agente responde em um unico round, sem loop de tools).
+pub fn tools_json_for(allowed_tools: &[String]) -> Option<String> {
+    let all: Value = serde_json::from_str(tools::TOOLS_JSON).ok()?;
+    let array = all.as_array()?;
+
+    let want: Vec<&str> = if allowed_tools.is_empty() {
+        BASE_TOOLS.to_vec()
+    } else {
+        allowed_tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| BASE_TOOLS.contains(name))
+            .collect()
+    };
+
+    let filtered: Vec<&Value> = array
+        .iter()
+        .filter(|entry| {
+            entry["function"]["name"]
+                .as_str()
+                .map(|name| want.contains(&name))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&filtered).ok()
+    }
 }

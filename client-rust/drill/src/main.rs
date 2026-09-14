@@ -1,10 +1,11 @@
 mod agent;
 mod config;
+mod history;
 mod subagents;
 mod tools;
 mod tui;
 
-use agent::{Agent, AgentEvent};
+use agent::Agent;
 use lib_rust::agents::ManagerEvent;
 use lib_rust::{GenerationType, RuntimeLlama};
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ struct Cli {
     dir: Option<PathBuf>,
     persona: Option<String>,
     headless: Option<String>,
+    mode: Option<String>,
 }
 
 impl Cli {
@@ -41,6 +43,7 @@ impl Cli {
             dir: None,
             persona: None,
             headless: None,
+            mode: None,
         };
 
         let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -87,6 +90,11 @@ impl Cli {
                     }
                 }
                 "--no-tools" => cli.tools = Some(false),
+                "--mode" => {
+                    if let Some(v) = next(&mut args, &mut i) {
+                        cli.mode = Some(v);
+                    }
+                }
                 "--headless" => {
                     if let Some(v) = next(&mut args, &mut i) {
                         cli.headless = Some(v);
@@ -115,6 +123,7 @@ impl Cli {
                          --no-tools        desabilita tool calls\n\
                          --dir <path>      diretorio de trabalho (default: cwd)\n\
                          --persona <texto> system prompt\n\
+                         --mode <m>        solo | agents (default solo)\n\
                          --headless <txt>  roda um turno sem TUI\n\n\
                          Modos (TUI):\n\
                            solo     conversa com o drill (default)\n\
@@ -145,6 +154,7 @@ struct Effective {
     dir: PathBuf,
     persona: String,
     headless: Option<String>,
+    mode: String,
     threads: i64,
     threads_batch: i64,
     flash_attn: String,
@@ -186,6 +196,7 @@ fn resolve(cli: Cli) -> Effective {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         persona: cli.persona.clone().unwrap_or(persona),
         headless: cli.headless.clone(),
+        mode: cli.mode.clone().unwrap_or_else(|| "solo".to_string()),
         threads,
         threads_batch,
         flash_attn,
@@ -219,7 +230,21 @@ fn main() {
     let has_thinking = engine.supports_thinking().unwrap_or(false);
     let engine = Arc::new(Mutex::new(engine));
     let interrupt = Arc::new(AtomicBool::new(false));
-    let mut agent = Agent::new(engine, eff.dir.clone(), eff.tools, eff.ctx, interrupt.clone());
+    let mut agent = Agent::new(
+        engine,
+        eff.dir.clone(),
+        eff.tools,
+        eff.ctx,
+        interrupt.clone(),
+        eff.persona.clone(),
+    );
+
+    match eff.mode.as_str() {
+        "agents" | "maestro" => agent.set_mode(agent::Mode::Agents),
+        _ => {}
+    }
+
+    agent.set_history(Arc::new(history::History::new(subagents::config_root())));
 
     let session = tui::SessionInfo::new(
         eff.model.clone(),
@@ -238,6 +263,26 @@ fn main() {
     );
 
     if let Some(headless_prompt) = eff.headless.clone() {
+        agent.set_event_sink(Arc::new(|ev: ManagerEvent| match ev {
+            ManagerEvent::Stream(kind) => match kind {
+                GenerationType::Content(text) => print!("{}", text),
+                GenerationType::Reasoning(text) => {
+                    eprintln!("\x1b[90m[raciocinio]\x1b[0m {}", text);
+                }
+                GenerationType::CallTool(tool) => {
+                    eprintln!("\x1b[35mcall {} args={}\x1b[0m", tool.name, tool.args);
+                }
+                GenerationType::ToolPreview(_) => {}
+            },
+            ManagerEvent::ToolStart(name) => eprintln!("\x1b[35m[tool] {}\x1b[0m", name),
+            ManagerEvent::ToolResult(name, result) => {
+                eprintln!("\x1b[33m[resultado de {}]\x1b[0m\n{}\n\x1b[33m---\x1b[0m", name, result)
+            }
+            ManagerEvent::Status(text) => eprintln!("\x1b[90m[status] {}\x1b[0m", text),
+            ManagerEvent::AgentWorking(name) => {
+                eprintln!("\x1b[36mtrabalhando: {}\x1b[0m", name);
+            }
+        }));
         return run_headless(&mut agent, &headless_prompt);
     }
 
@@ -253,27 +298,10 @@ fn main() {
 }
 
 fn run_headless(agent: &mut Agent, prompt: &str) {
-    let result = agent.run_turn(prompt, |ev| match ev {
-        AgentEvent::Stream(kind) => match kind {
-            GenerationType::Content(text) => print!("{}", text),
-            GenerationType::Reasoning(text) => {
-                eprintln!("\x1b[90m[raciocinio]\x1b[0m {}", text);
-            }
-            GenerationType::CallTool(tool) => {
-                eprintln!("\x1b[35mcall {} args={}\x1b[0m", tool.name, tool.args);
-            }
-            GenerationType::ToolPreview(_) => {}
-        },
-        AgentEvent::ToolStart(name) => eprintln!("\x1b[35m[tool] {}\x1b[0m", name),
-        AgentEvent::ToolResult(name, result) => {
-            eprintln!("\x1b[33m[resultado de {}]\x1b[0m\n{}\n\x1b[33m---\x1b[0m", name, result)
-        }
-        AgentEvent::Status(text) => eprintln!("\x1b[90m[status] {}\x1b[0m", text),
-    });
-
-    match result {
-        Ok(()) => {
-            if let Some((tokens, tps)) = agent.last_stats() {
+    match agent.run_turn(prompt) {
+        Ok(turn) => {
+            println!();
+            if let (Some(tokens), Some(tps)) = (turn.tokens, turn.tps) {
                 eprintln!("\x1b[90m[{:.1} tok/s, {} tokens]\x1b[0m", tps, tokens);
             }
         }
@@ -294,7 +322,7 @@ fn build_engine(eff: &Effective) -> Result<RuntimeLlama, String> {
         None,
         None,
         Some(eff.ngl),
-        Some(eff.persona.clone()),
+        None, // system prompt vem do historico de cada agente (sem excecao nativa)
     )
         .map_err(|err| err.to_string())?;
 
@@ -335,7 +363,8 @@ fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<t
         let _ = events.send(event);
     };
 
-    // Modo agents: eventos da fila do manager chegam direto na UI.
+    // Eventos de progresso da fila (stream/tool/status) chegam direto na UI,
+    // tanto em solo quanto em agents (mesmo caminho de geracao).
     let sink_events = events.clone();
     agent.set_event_sink(Arc::new(move |ev: ManagerEvent| {
         let ui = match ev {
@@ -352,6 +381,7 @@ fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<t
                 tui::UiEvent::ToolResult { name, result }
             }
             ManagerEvent::Status(text) => tui::UiEvent::Status(text),
+            ManagerEvent::AgentWorking(name) => tui::UiEvent::AgentWorking(name),
         };
         let _ = sink_events.send(ui);
     }));
@@ -366,37 +396,25 @@ fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<t
             agent::WorkerMsg::Turn(input) => input,
         };
 
-        let result = agent.run_turn(&input, |ev| {
-            let ui = match ev {
-                AgentEvent::Stream(kind) => match kind {
-                    GenerationType::Content(text) => tui::UiEvent::Content(text),
-                    GenerationType::Reasoning(text) => tui::UiEvent::Reasoning(text),
-                    GenerationType::CallTool(tool) => {
-                        tui::UiEvent::ToolCall(tool.name)
-                    }
-                    GenerationType::ToolPreview(_) => tui::UiEvent::Status("tool preview".to_string()),
-                },
-                AgentEvent::ToolStart(name) => tui::UiEvent::ToolStart(name),
-                AgentEvent::ToolResult(name, result) => {
-                    tui::UiEvent::ToolResult { name, result }
-                }
-                AgentEvent::Status(text) => tui::UiEvent::Status(text),
-            };
-            send(ui);
-        });
+        let result = agent.run_turn(&input);
 
         match result {
-            Ok(()) => {
-                if let Some((tokens, tps)) = agent.last_stats() {
+            Ok(turn) => {
+                if let (Some(tokens), Some(tps)) = (turn.tokens, turn.tps) {
                     send(tui::UiEvent::Stats { tokens, tps });
                 }
+                let used = turn
+                    .context_tokens
+                    .filter(|&t| t > 0)
+                    .map(|t| t as usize)
+                    .unwrap_or_else(|| agent.context_estimate());
+                send(tui::UiEvent::ContextUsage {
+                    used,
+                    max: agent.ctx_max(),
+                });
             }
             Err(err) => send(tui::UiEvent::Err(err)),
         }
-        send(tui::UiEvent::ContextUsage {
-            used: agent.context_used(),
-            max: agent.ctx_max(),
-        });
         send(tui::UiEvent::Done);
     }
 }
