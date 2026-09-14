@@ -77,7 +77,7 @@ fn guess_mtp_model(model_path: &str) -> Option<String> {
         .map(|path| path.to_string_lossy().to_string())
 }
 
-fn stream_stdout(chunk: GenerationType, _tokens_seconds: i32) {
+fn stream_stdout(chunk: GenerationType, _mode: i32, _tokens_seconds: i32) {
     let mut state = stream_state().lock().unwrap();
     match chunk {
         GenerationType::Content(text) => {
@@ -94,6 +94,7 @@ fn stream_stdout(chunk: GenerationType, _tokens_seconds: i32) {
             let _ = io::stdout().flush();
         }
         GenerationType::CallTool(_) => {}
+        GenerationType::ToolPreview(_) => {}
     }
 }
 

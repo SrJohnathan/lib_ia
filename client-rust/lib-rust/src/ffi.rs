@@ -469,7 +469,7 @@ unsafe extern "C" {
     ) -> *mut c_char;
     pub fn libia_runtime_last_context_tokens(runtime: *const libia_runtime) -> c_longlong;
     pub fn libia_runtime_last_generated_tokens(runtime: *const libia_runtime) -> c_longlong;
-    pub fn libia_runtime_last_tokens_per_second(runtime: *const libia_runtime) -> c_int;
+    pub fn libia_runtime_last_tokens_per_second(runtime: *const libia_runtime) -> c_double;
     pub fn libia_runtime_supports_thinking(runtime: *const libia_runtime) -> bool;
     pub fn libia_runtime_chat_template_caps_json(runtime: *const libia_runtime) -> *mut c_char;
 

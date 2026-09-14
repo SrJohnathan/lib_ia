@@ -483,6 +483,73 @@ impl RuntimeLlama {
         Ok(())
     }
 
+    pub fn set_int_prop(&mut self, prop: &str, value: i64) -> Result<()> {
+        let prop_name = to_cstring(prop)?;
+        let mut error: *mut libc::c_char = std::ptr::null_mut();
+        unsafe {
+            if !ffi::libia_params_set_int(
+                self.params.as_ptr(),
+                prop_name.as_ptr(),
+                value,
+                &mut error,
+            ) {
+                let message = unsafe {
+                    take_owned_c_string(error).unwrap_or_else(|_| {
+                        format!("failed to set int option {}", prop)
+                    })
+                };
+                return Err(Error::Api(message));
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn set_string_prop(&mut self, prop: &str, value: &str) -> Result<()> {
+        let prop_name = to_cstring(prop)?;
+        let prop_value = to_cstring(value)?;
+        let mut error: *mut libc::c_char = std::ptr::null_mut();
+        unsafe {
+            if !ffi::libia_params_set_string(
+                self.params.as_ptr(),
+                prop_name.as_ptr(),
+                prop_value.as_ptr(),
+                &mut error,
+            ) {
+                let message = unsafe {
+                    take_owned_c_string(error).unwrap_or_else(|_| {
+                        format!("failed to set string option {}", prop)
+                    })
+                };
+                return Err(Error::Api(message));
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn set_bool_prop_raw(&mut self, prop: &str, value: bool) -> Result<()> {
+        let prop_name = to_cstring(prop)?;
+        let mut error: *mut libc::c_char = std::ptr::null_mut();
+        unsafe {
+            if !ffi::libia_params_set_bool(
+                self.params.as_ptr(),
+                prop_name.as_ptr(),
+                value,
+                &mut error,
+            ) {
+                let message = unsafe {
+                    take_owned_c_string(error).unwrap_or_else(|_| {
+                        format!("failed to set bool option {}", prop)
+                    })
+                };
+                return Err(Error::Api(message));
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn set_bool_prop(&mut self, prop: &str, value: bool) -> Result<()> {
         let prop_name = normalize_prop_name(prop);
         let prop = to_cstring(&prop_name)?;
@@ -716,10 +783,37 @@ impl RuntimeLlama {
         Some(value as i64)
     }
 
-    pub fn last_tokens_per_second(&mut self) -> Option<i32> {
+    pub fn last_tokens_per_second(&mut self) -> Option<f64> {
         let runtime = self.runtime.as_ref()?;
         let value = unsafe { ffi::libia_runtime_last_tokens_per_second(runtime.as_ptr()) };
-        Some(value as i32)
+        Some(value)
+    }
+
+    pub fn tokenize_text(&mut self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
+        let runtime = self.ensure_runtime()?;
+        let text_c = to_cstring(text)?;
+        let mut error: *mut libc::c_char = std::ptr::null_mut();
+        let raw = unsafe {
+            ffi::libia_runtime_tokenize_text(
+                runtime.as_ptr(),
+                text_c.as_ptr(),
+                add_special,
+                parse_special,
+                &mut error,
+            )
+        };
+        if raw.is_null() {
+            let message = unsafe {
+                take_owned_c_string(error).unwrap_or_else(|_| "tokenize failed".to_string())
+            };
+            return Err(Error::Api(message));
+        }
+        let csv = unsafe { take_owned_c_string(raw)? };
+        Ok(csv
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.trim().parse::<i32>().ok())
+            .collect())
     }
 
     pub fn system_info(&self) -> Option<String> {

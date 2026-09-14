@@ -2,3 +2,6 @@
 /client-rust/target/
 /build/
 /vendor/test-image-create/build/
+
+# Stakpak session files
+.stakpak/session*

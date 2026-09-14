@@ -23,6 +23,12 @@
 #include <utility>
 #include <vector>
 
+// [perf] per-token instrumentation is off by default; enable with LIBIA_PERF=1.
+static bool perf_log_enabled() {
+    static const bool enabled = std::getenv("LIBIA_PERF") != nullptr;
+    return enabled;
+}
+
 namespace {
     struct libia_params_impl {
         common_params params;
@@ -500,11 +506,13 @@ static bool init_runtime(libia_runtime_impl *rt, std::string *error) {
         }
 
         const int32_t spec_n_max = rt->spec ? common_speculative_n_max(rt->spec.get()) : 1;
-        std::cerr << "[debug] rt->spec=" << (void *) rt->spec.get()
-                << " spec_n_max=" << spec_n_max
-                << " ctx_dft=" << (void *) rt->params.params.speculative.draft.ctx_dft
-                << " ctx_tgt=" << (void *) rt->params.params.speculative.draft.ctx_tgt
-                << "\n";
+        if (perf_log_enabled()) {
+            std::cerr << "[debug] rt->spec=" << (void *) rt->spec.get()
+                    << " spec_n_max=" << spec_n_max
+                    << " ctx_dft=" << (void *) rt->params.params.speculative.draft.ctx_dft
+                    << " ctx_tgt=" << (void *) rt->params.params.speculative.draft.ctx_tgt
+                    << "\n";
+        }
         const int32_t max_batch_tokens = std::max<int32_t>(32, spec_n_max + 2);
         llama_batch batch = llama_batch_init(max_batch_tokens, 0, 1);
         auto cleanup = [&]() { llama_batch_free(batch); };
@@ -605,7 +613,7 @@ static bool init_runtime(libia_runtime_impl *rt, std::string *error) {
                                parsed.content.empty() ? parsed.render_content() : parsed.content, mode, tps);
                 };
 
-                if (is_partial && parsed_state.has_parsed_msg) {
+                if (parsed_state.has_parsed_msg) {
                     try {
                         const auto diffs = common_chat_msg_diff::compute_diffs(parsed_state.parsed_msg, parsed);
                         for (const auto &diff: diffs) {
@@ -814,15 +822,17 @@ static bool init_runtime(libia_runtime_impl *rt, std::string *error) {
                     dbg_accept += dbg_ids_sizes[k] > 0 ? (double) (dbg_ids_sizes[k] - 1) : 0;
                 }
                 dbg_accept = dbg_ids_sizes.empty() ? 0.0 : dbg_accept / (double) dbg_ids_sizes.size();
-                std::cerr << "[perf] iter=" << dbg_iter
-                          << " draft_ms=" << dbg_mean_draft / 1000.0
-                          << " decode_ms=" << (dbg_t_decode / dbg_iter) / 1000.0
-                          << " process_ms=" << (dbg_t_process / dbg_iter) / 1000.0
-                          << " samp_ms=" << (dbg_t_samp / dbg_iter) / 1000.0
-                          << " emit_ms=" << (dbg_t_emit / dbg_iter) / 1000.0
-                          << " iter_ms=" << (dbg_t_iter_wall / dbg_iter) / 1000.0
-                          << " avg_accepted=" << dbg_accept
-                          << " (out=" << generated_tokens << ")\n";
+                if (perf_log_enabled()) {
+                    std::cerr << "[perf] iter=" << dbg_iter
+                              << " draft_ms=" << dbg_mean_draft / 1000.0
+                              << " decode_ms=" << (dbg_t_decode / dbg_iter) / 1000.0
+                              << " process_ms=" << (dbg_t_process / dbg_iter) / 1000.0
+                              << " samp_ms=" << (dbg_t_samp / dbg_iter) / 1000.0
+                              << " emit_ms=" << (dbg_t_emit / dbg_iter) / 1000.0
+                              << " iter_ms=" << (dbg_t_iter_wall / dbg_iter) / 1000.0
+                              << " avg_accepted=" << dbg_accept
+                              << " (out=" << generated_tokens << ")\n";
+                }
                 (void) dbg_t0;
 
                 if (eog_reached) break;
