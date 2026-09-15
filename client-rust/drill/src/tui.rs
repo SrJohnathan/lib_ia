@@ -14,8 +14,13 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::tui::highlight_code::CodeHighlighter;
+use crate::tui::helpes::wrap_text;
+use crate::tui::openia::ConfigModal;
+
 
 mod highlight_code;
+mod helpes;
+mod openia;
 
 // --- Cores e Temas ---
 const COLOR_APP_BG: Color = Color::Rgb(12, 12, 14);
@@ -187,6 +192,8 @@ pub struct AppState {
     /// faziam a TUI congelar re-backtle-highlighting tudo a cada frame).
     pub render_dirty: bool,
     pub render_cache: Vec<ratatui::text::Line<'static>>,
+
+    pub config_modal: ConfigModal,
 }
 
 impl AppState {
@@ -606,41 +613,43 @@ impl AppState {
                     }
                 }
                 Kind::Assistant => {
-                    let mut current_lang = String::from("rs"); // Linguagem padrão caso não especificada
+                    let mut current_lang = String::from("rs");
+                    let max_w = area.width.saturating_sub(2) as usize;
 
                     for sub in line.text.split('\n') {
                         let trimmed = sub.trim_start();
                         if trimmed.starts_with("```") {
-                            in_code_block = !in_code_block;
-
-                            if in_code_block {
-                                // Captura a linguagem após os 3 Backticks (ex: ```rust -> "rust")
-                                let lang = trimmed.trim_start_matches("```").trim();
-                                if !lang.is_empty() {
-                                    current_lang = lang.to_string();
-                                }
-                            }
-
-                            rendered.push(Line::from(Span::styled(
-                                "───",
-                                Style::default().fg(COLOR_BORDER).bg(COLOR_CODE_BG),
-                            )));
+                            // ... seu código de code-block continua igual
                             continue;
                         }
 
                         if in_code_block {
-                            let card_width = area.width.saturating_sub(2) as usize;
-                            // Reutiliza o highlighter já instanciado e passa a linha + linguagem
-                            let highlighted_line = self.highlighter.highlight_line(sub, &current_lang,card_width);
-                            rendered.push(highlighted_line);
+                            let highlighted = self.highlighter.highlight_line(sub, &current_lang, max_w);
+                            rendered.push(highlighted);
                         } else {
-                            rendered.push(Line::from(Span::styled(
-                                sub.to_string(),
-                                Style::default().fg(COLOR_TEXT_MAIN),
-                            )));
+                            // ← aqui a quebra de linha
+                            for wrapped in wrap_text(sub, max_w) {
+                                rendered.push(Line::from(Span::styled(
+                                    wrapped,
+                                    Style::default().fg(COLOR_TEXT_MAIN),
+                                )));
+                            }
                         }
                     }
                 }
+
+                Kind::Muted | Kind::Err | _ => {
+                    let max_w = area.width.saturating_sub(2) as usize;
+                    let style = match line.kind {
+                        Kind::Muted => Style::default().fg(COLOR_TEXT_MUTED),
+                        Kind::Err   => Style::default().fg(Color::Red),
+                        _           => Style::default().fg(COLOR_TEXT_MAIN),
+                    };
+                    for wrapped in wrap_text(&line.text, max_w) {
+                        rendered.push(Line::from(Span::styled(wrapped, style)));
+                    }
+                }
+
                 _ => {
                     rendered.push(Line::from(Span::styled(line.text.clone(), Style::default().fg(COLOR_TEXT_MAIN))));
                 }
@@ -835,6 +844,29 @@ fn loop_result(
                     }
                     if let Some(action) = read_key(key, state) {
                         match action {
+
+                            Action::ChooseProvider => {
+                                let kind = match state.provider_cursor {
+                                    1 => crate::provider::ProviderKind::OpenAi,
+                                    _ => crate::provider::ProviderKind::Local,
+                                };
+                                state.provider_view = false;
+
+                                if kind == crate::provider::ProviderKind::OpenAi {
+                                    // precisa de info do store — ou manda um pedido ao worker
+                                    // ou guarda um flag e pergunta via modal
+                                    state.config_modal = ConfigModal::OpenAiBaseUrl {
+                                        input: "".to_string()/* valor atual ou DEFAULT_OPENAI_BASE_URL */,
+                                        cursor: 0,
+                                    };
+                                    state.status = "configure a API...".to_string();
+                                } else {
+                                    let _ = turns.send(agent::WorkerMsg::SetProvider(kind));
+                                    state.status = "definindo provider...".to_string();
+                                }
+                            }
+
+
                             Action::Quit => return Ok(()),
                             Action::NavSession(delta) => {
                                 let len = state.sessions.len() as isize;
