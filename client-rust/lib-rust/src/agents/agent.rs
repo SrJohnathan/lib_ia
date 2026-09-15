@@ -64,6 +64,8 @@ impl AgentState {
 /// Linha de historico persistente gerada ao final de cada turno. O `kind`
 /// indica a natureza do registro: "root" (turno do usuario no drill/maestro),
 /// "main" (trabalho de um subagente) ou "resumo" (resumo reflexivo do agente).
+/// `session_id` agrupa os turnos de uma conversa e `mode` informa o modo do
+/// root ("solo" ou "agents") para a lista de sessoes.
 /// E entregue ao listener registrado via `AgentManager::set_history`.
 #[derive(Debug, Clone)]
 pub struct HistoryRow {
@@ -74,6 +76,8 @@ pub struct HistoryRow {
     pub tokens: Option<i64>,
     pub tps: Option<f64>,
     pub context_tokens: Option<i64>,
+    pub session_id: String,
+    pub mode: String,
 }
 
 /// Resultado de um turno. Stats sao lidos na MESMA thread que gerou

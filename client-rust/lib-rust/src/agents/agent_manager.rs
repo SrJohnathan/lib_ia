@@ -35,6 +35,26 @@ pub enum ManagerEvent {
     AgentWorking(String),
 }
 
+/// Eventos de progresso de UM round de geracao remota (provider API). O
+/// gerador (`run_remote_turn`) chama isso enquanto o modelo responde.
+#[derive(Debug, Clone)]
+pub enum RemoteEvent {
+    Content(String),
+    Reasoning(String),
+    ToolCall(ToolCall),
+}
+
+/// Saida estruturada de um round remoto: texto final, tool calls emitidos e
+/// stats de uso (None quando o endpoint nao reporta).
+#[derive(Debug, Clone)]
+pub struct RemoteModelOutput {
+    pub content: String,
+    pub calls: Vec<ToolCall>,
+    pub tokens: Option<i64>,
+    pub tps: Option<f64>,
+    pub context_tokens: Option<i64>,
+}
+
 /// Fila serial de agentes + registro de estados. Nao conhece tools nem loop de
 /// geracao: toda geracao roda em `run_turn_unified`, NA MESMA thread que
 /// consome a fila (e que depois le as stats do engine).
@@ -48,6 +68,8 @@ pub struct AgentManager {
     interrupt: Arc<AtomicBool>,
     max_tool_rounds: usize,
     history: Arc<Mutex<Option<HistoryListener>>>,
+    /// Contexto da sessao atual (id + modo) aplicado a toda linha gravada.
+    session: Arc<Mutex<(String, String)>>,
 }
 
 impl AgentManager {
@@ -63,6 +85,7 @@ impl AgentManager {
             interrupt: Arc::new(AtomicBool::new(false)),
             max_tool_rounds: MAX_TOOL_ROUNDS,
             history: Arc::new(Mutex::new(None)),
+            session: Arc::new(Mutex::new((String::new(), "solo".to_string()))),
         }
     }
 
@@ -126,6 +149,22 @@ impl AgentManager {
         *self.history.lock().unwrap() = Some(listener);
     }
 
+    /// Define o contexto de sessao (id + modo) aplicado a toda linha gravada.
+    pub fn set_session(&self, session_id: String, mode: String) {
+        *self.session.lock().unwrap() = (session_id, mode);
+    }
+
+    /// Substitui o historico vivo de um agente (ex.: retomar uma conversa
+    /// carregada de LanceDB). O persona atual NAO e re-Injetado aqui: o
+    /// chamador pre-anexa a mensagem system ao proprio vetor.
+    pub fn resume(&self, agent_id: &str, messages: Vec<ChatMessage>) {
+        if let Ok(mut guard) = self.states.lock() {
+            if let Some(state) = guard.get_mut(agent_id) {
+                state.history = messages;
+            }
+        }
+    }
+
     pub fn set_summary(&self, agent_id: &str, summary: String) {
         if let Ok(mut guard) = self.states.lock() {
             if let Some(state) = guard.get_mut(agent_id) {
@@ -137,6 +176,15 @@ impl AgentManager {
     /// Envia uma task para a fila e bloqueia no reply. Serial: o runtime so e
     /// usado por uma thread por vez (o worker da fila).
     pub fn enqueue(&self, agent_id: &str, input: &str) -> Result<TurnResult, String> {
+        // Worker nao iniciado (ex.: drill iniciou sem modelo local porque o
+        // provider e remoto): nao ha quem processe; perde-se em vez de travar.
+        if self.queue_rx.lock().unwrap().is_some() {
+            return Err(
+                "runtime local nao iniciado (provider remoto sem modelo GGUF) \
+                 — reinicie o drill com um modelo local para usar esta via"
+                    .to_string(),
+            );
+        }
         let (tx, rx) = channel();
         let task = AgentTask::new(agent_id.to_string(), input.to_string(), tx);
         self.queue_tx.send(task).map_err(|err| err.to_string())?;
@@ -156,6 +204,7 @@ impl AgentManager {
         let events = Arc::clone(&self.events);
         let interrupt = Arc::clone(&self.interrupt);
         let history = Arc::clone(&self.history);
+        let session = Arc::clone(&self.session);
         let max_tool_rounds = self.max_tool_rounds;
 
         thread::spawn(move || {
@@ -183,6 +232,7 @@ impl AgentManager {
                     true,
                     history,
                     "root",
+                    session.clone(),
                 );
 
                 if let Ok(mut guard) = states.lock() {
@@ -249,6 +299,7 @@ impl AgentManager {
             false,
             history,
             kind,
+            Arc::clone(&self.session),
         );
         if result.is_ok() {
             if let Ok(mut guard) = self.states.lock() {
@@ -273,6 +324,7 @@ impl AgentManager {
         stream_events: bool,
         history: Option<HistoryListener>,
         kind: &str,
+        session: Arc<Mutex<(String, String)>>,
     ) -> Result<TurnResult, String> {
         // Card da UI: qual agente esta trabalhando agora (também em inline).
         if let Some(sink) = events.lock().unwrap().as_ref() {
@@ -307,11 +359,19 @@ impl AgentManager {
         let mut nudges = 0;
         let mut any_tool_executed = false;
 
+        // `emit` gaiola o fluxo de tokens; `emit_always` entrega status e
+        // atividade de ferramenta MESMO em turnos inline (ask_agent): o usuario
+        // ve o subagente trabalhando ao vivo em vez de tela congelada.
         let emit = |event: ManagerEvent| {
             if stream_events {
                 if let Some(sink) = events.lock().unwrap().as_ref() {
                     sink(event);
                 }
+            }
+        };
+        let emit_always = |event: ManagerEvent| {
+            if let Some(sink) = events.lock().unwrap().as_ref() {
+                sink(event);
             }
         };
 
@@ -321,7 +381,11 @@ impl AgentManager {
         for round in 0..limit {
             let use_tools = use_tools_any
                 && (!state.config.force_tools || round + 1 < limit);
-            emit(ManagerEvent::Status(format!("generating ({})", round + 1)));
+            emit_always(ManagerEvent::Status(format!(
+                "{}: gerando ({})",
+                state.config.agent_id,
+                round + 1
+            )));
 
             let mut calls: Vec<ToolCall> = Vec::new();
             let mut reasoning = String::new();
@@ -373,7 +437,7 @@ impl AgentManager {
             // a chamada para nao depender da vontade do modelo.
             if calls.is_empty() {
                 if let Some(parsed) = parse_tool_json(&output) {
-                    emit(ManagerEvent::Status(format!(
+                    emit_always(ManagerEvent::Status(format!(
                         "tool call via fallback JSON: {}",
                         parsed.name
                     )));
@@ -384,7 +448,7 @@ impl AgentManager {
             if interrupt.swap(false, Ordering::Relaxed) {
                 reply = output;
                 finished = true;
-                emit(ManagerEvent::Status("interrompido".to_string()));
+                emit_always(ManagerEvent::Status("interrompido".to_string()));
                 break;
             }
 
@@ -398,7 +462,7 @@ impl AgentManager {
                     && nudges < 2
                 {
                     nudges += 1;
-                    emit(ManagerEvent::Status(format!(
+                    emit_always(ManagerEvent::Status(format!(
                         "sem tool call em {}; forcando (round {})",
                         state.config.agent_id,
                         round + 2
@@ -418,20 +482,25 @@ impl AgentManager {
                 }
                 reply = output;
                 finished = true;
-                emit(ManagerEvent::Status("done".to_string()));
+                emit_always(ManagerEvent::Status("done".to_string()));
                 break;
             }
 
             for call in &calls {
-                emit(ManagerEvent::ToolStart(call.name.clone()));
+                let name = call.name.clone();
+                let start = std::time::Instant::now();
+                emit_always(ManagerEvent::ToolStart(name.clone()));
                 let result = match &executor {
-                    Some(exec) => match exec(&call.name, call.args.clone()) {
+                    Some(exec) => match exec(&name, call.args.clone()) {
                         Ok(text) => text,
                         Err(err) => format!("ERROR: {}", err),
                     },
                     None => "(sem executor de ferramentas)".to_string(),
                 };
-                emit(ManagerEvent::ToolResult(call.name.clone(), result.clone()));
+                emit_always(ManagerEvent::ToolResult(
+                    name.clone(),
+                    format!("[executou em {:.1}s]\n{}", start.elapsed().as_secs_f64(), result),
+                ));
                 state.history.push(ChatMessage {
                     role: "user".to_string(),
                     content: format!(
@@ -459,6 +528,10 @@ impl AgentManager {
         };
 
         if let Some(listener) = history.as_ref() {
+            let (session_id, mode) = {
+                let guard = session.lock().unwrap();
+                (guard.0.clone(), guard.1.clone())
+            };
             listener(HistoryRow {
                 agent_id: state.config.agent_id.clone(),
                 kind: kind.to_string(),
@@ -467,6 +540,8 @@ impl AgentManager {
                 tokens,
                 tps,
                 context_tokens,
+                session_id,
+                mode,
             });
         }
 
@@ -475,6 +550,290 @@ impl AgentManager {
             tokens,
             tps,
             context_tokens,
+        })
+    }
+
+    /// Variante REMOTA de `run_turn_unified`: mesma semantica de historico,
+    /// rounds de tools, eventos e stats, mas a geracao de cada round e feita
+    /// pelo chamador (`generate`), que recebe as mensagens OpenAI (`Vec<Value>`
+    /// com `{role, content, tool_calls?, tool_call_id?}`) e devolve
+    /// `RemoteModelOutput`. SUBAGENTES nao passam por aqui: quem usa esta via e
+    /// o Root (solo/maestro) quando o provider configurado e remoto.
+    ///
+    /// Roda NA thread do chamador (nao enfileira): o worker da fila segue livre
+    /// para subagentes inline (ask_agent) no engine local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_remote_turn(
+        &self,
+        agent_id: &str,
+        input: &str,
+        kind: &str,
+        stream_events: bool,
+        generate: &dyn Fn(
+            Vec<Value>,
+            &mut dyn FnMut(RemoteEvent),
+        ) -> Result<RemoteModelOutput, String>,
+    ) -> Result<TurnResult, String> {
+        let executor = self.executor.lock().unwrap().clone();
+        let events = Arc::clone(&self.events);
+        let interrupt = Arc::clone(&self.interrupt);
+        let history = self.history.lock().unwrap().clone();
+        let max_tool_rounds = self.max_tool_rounds;
+
+        let mut state = self
+            .get(agent_id)
+            .ok_or_else(|| format!("agente '{}' não encontrado", agent_id))?;
+
+        if let Some(sink) = events.lock().unwrap().as_ref() {
+            sink(ManagerEvent::AgentWorking(state.config.agent_id.clone()));
+        }
+
+        if state.history.is_empty() && !state.config.prompt.is_empty() {
+            state.history.push(ChatMessage {
+                role: "system".to_string(),
+                content: state.config.prompt.clone(),
+                reasoning_content: None,
+            });
+        }
+        state.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: input.to_string(),
+            reasoning_content: None,
+        });
+
+        // Mensagens no formato OpenAI a partir do historico vivo do agente.
+        let mut messages: Vec<Value> = state
+            .history
+            .iter()
+            .map(|m| {
+                json!({
+                    "role": m.role,
+                    "content": m.content,
+                })
+            })
+            .collect();
+
+        let use_tools_any = state.config.tools_json.is_some();
+        let limit = if use_tools_any {
+            if state.config.force_tools {
+                max_tool_rounds + 1
+            } else {
+                max_tool_rounds
+            }
+        } else {
+            1
+        };
+
+        let emit = |event: ManagerEvent| {
+            if stream_events {
+                if let Some(sink) = events.lock().unwrap().as_ref() {
+                    sink(event);
+                }
+            }
+        };
+        let emit_always = |event: ManagerEvent| {
+            if let Some(sink) = events.lock().unwrap().as_ref() {
+                sink(event);
+            }
+        };
+
+        let mut reply_text = String::new();
+        let mut finished = false;
+        let mut nudges = 0;
+        let mut any_tool_executed = false;
+        let mut final_stats: (Option<i64>, Option<f64>, Option<i64>) = (None, None, None);
+
+        for round in 0..limit {
+            let use_tools = use_tools_any
+                && (!state.config.force_tools || round + 1 < limit);
+            emit_always(ManagerEvent::Status(format!(
+                "{}: gerando ({})",
+                state.config.agent_id,
+                round + 1
+            )));
+
+            let output = {
+                let mut cb = |ev: RemoteEvent| {
+                    match ev {
+                        RemoteEvent::Content(text) => {
+                            emit(ManagerEvent::Stream(GenerationType::Content(text)));
+                        }
+                        RemoteEvent::Reasoning(text) => {
+                            emit(ManagerEvent::Stream(GenerationType::Reasoning(text)));
+                        }
+                        RemoteEvent::ToolCall(tool) => {
+                            // UI (streaming ao vivo); a lista autoritativa vem
+                            // de `output.calls` ao final do round.
+                            emit(ManagerEvent::Stream(GenerationType::CallTool(tool)));
+                        }
+                    }
+                };
+                generate(messages.clone(), &mut cb)
+            }?;
+
+            final_stats = (output.tokens, output.tps, output.context_tokens);
+
+            let mut calls = output.calls;
+            // Fallback: modelo escreveu o tool call como texto (```json / <tool_call>)
+            // em vez de emiti-lo via API.
+            if calls.is_empty() {
+                if let Some(parsed) = parse_tool_json(&output.content) {
+                    emit_always(ManagerEvent::Status(format!(
+                        "tool call via fallback JSON: {}",
+                        parsed.name
+                    )));
+                    calls.push(parsed);
+                }
+            }
+
+            // Atualiza historico vivo (mesma forma do caminho local) e monta a
+            // mensagem do assistente para o provider (com tool_calls, se houve).
+            state.history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: output.content.clone(),
+                reasoning_content: None,
+            });
+            let mut assistant_msg = json!({
+                "role": "assistant",
+                "content": output.content,
+            });
+            if !calls.is_empty() {
+                let tcs: Vec<Value> = calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": c.name,
+                                "arguments": serde_json::to_string(&c.args)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            }
+                        })
+                    })
+                    .collect();
+                assistant_msg["tool_calls"] = Value::Array(tcs);
+            }
+            messages.push(assistant_msg);
+
+            if interrupt.swap(false, Ordering::Relaxed) {
+                reply_text = state
+                    .history
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                finished = true;
+                emit_always(ManagerEvent::Status("interrompido".to_string()));
+                break;
+            }
+
+            if !use_tools || calls.is_empty() {
+                if use_tools
+                    && state.config.force_tools
+                    && !any_tool_executed
+                    && round + 1 < limit
+                    && nudges < 2
+                {
+                    nudges += 1;
+                    emit_always(ManagerEvent::Status(format!(
+                        "sem tool call em {}; forcando (round {})",
+                        state.config.agent_id,
+                        round + 2
+                    )));
+                    let nudge = "\nATENCAO: a sua resposta anterior NAO executou nenhuma ferramenta. \
+                                  Se a tarefa do usuario exige uma ferramenta, essa acao NAO foi feita \
+                                  e voce NAO deve reportar como feita. Chame AGORA a ferramenta \
+                                  apropriada com os argumentos completos. Se a tarefa nao requer \
+                                  ferramenta, responda a pergunta do usuario diretamente, sem falar \
+                                  em ferramentas."
+                        .to_string();
+                    state.history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: nudge.clone(),
+                        reasoning_content: None,
+                    });
+                    messages.push(json!({
+                        "role": "user",
+                        "content": nudge,
+                    }));
+                    continue;
+                }
+                reply_text = state
+                    .history
+                    .last()
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                finished = true;
+                emit_always(ManagerEvent::Status("done".to_string()));
+                break;
+            }
+
+            for call in &calls {
+                let name = call.name.clone();
+                let start = std::time::Instant::now();
+                emit_always(ManagerEvent::ToolStart(name.clone()));
+                let result = match &executor {
+                    Some(exec) => match exec(&name, call.args.clone()) {
+                        Ok(text) => text,
+                        Err(err) => format!("ERROR: {}", err),
+                    },
+                    None => "(sem executor de ferramentas)".to_string(),
+                };
+                emit_always(ManagerEvent::ToolResult(
+                    name.clone(),
+                    format!("[executou em {:.1}s]\n{}", start.elapsed().as_secs_f64(), result),
+                ));
+                let tool_block = format!(
+                    "\n<tool_result> name={} id={}\n{}\n</tool_result>",
+                    call.name, call.call_id, result
+                );
+                state.history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: tool_block.clone(),
+                    reasoning_content: None,
+                });
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": tool_block,
+                }));
+            }
+            any_tool_executed = true;
+        }
+
+        if !finished {
+            return Err("max tool rounds reached without final answer".to_string());
+        }
+
+        // Grava a linha de historico persistente (mesmos campos do caminho local).
+        if let Some(listener) = history.as_ref() {
+            let (session_id, mode) = {
+                let guard = self.session.lock().unwrap();
+                (guard.0.clone(), guard.1.clone())
+            };
+            listener(HistoryRow {
+                agent_id: state.config.agent_id.clone(),
+                kind: kind.to_string(),
+                input: input.to_string(),
+                reply: reply_text.clone(),
+                tokens: final_stats.0,
+                tps: final_stats.1,
+                context_tokens: final_stats.2,
+                session_id,
+                mode,
+            });
+        }
+
+        // Grava o estado vivo de volta na fila, como faz o caminho local.
+        if let Ok(mut guard) = self.states.lock() {
+            guard.insert(agent_id.to_string(), state);
+        }
+
+        Ok(TurnResult {
+            reply: reply_text,
+            tokens: final_stats.0,
+            tps: final_stats.1,
+            context_tokens: final_stats.2,
         })
     }
 }

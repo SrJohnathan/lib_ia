@@ -9,6 +9,7 @@ pub mod runtime;
 pub mod sst;
 
 pub mod agents;
+pub mod tools;
 
 pub use error::{Error, Result};
 pub use image::StableDiffusionImage;

@@ -874,6 +874,11 @@ fn tool_call_from_value(value: serde_json::Value) -> ToolCall {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("tool")
         .to_string();
+    let raw_args = value
+        .get("args")
+        .or_else(|| value.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
     ToolCall {
         command: value
             .get("command")
@@ -885,12 +890,35 @@ fn tool_call_from_value(value: serde_json::Value) -> ToolCall {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        args: value
-            .get("args")
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+        args: normalize_args(raw_args),
         name,
     }
+}
+
+/// Torna `args` sempre um objeto, custe o que custar. O lado C do lib_ia
+/// despeja `tool.arguments` em `args` como um OBJETO quando o JSON parseia,
+/// mas como STRING crua quando o modelo escreve um JSON quebrado/truncado
+/// (ex.: prompt com aspas nao escapadas). "missing name/prompt" nos
+/// executores acontece quando `args` chega como string e o executor faz
+/// `args.get("name")` num `Value::String`.
+fn normalize_args(args: serde_json::Value) -> serde_json::Value {
+    if let Some(text) = args.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+            return parsed;
+        }
+        // O modelo pode ter embrulhado o JSON com texto/rails soltos.
+        if let Some(open) = text.find('{') {
+            if let Some(close) = text.rfind('}') {
+                if let Ok(parsed) =
+                    serde_json::from_str::<serde_json::Value>(&text[open..=close])
+                {
+                    return parsed;
+                }
+            }
+        }
+        return args;
+    }
+    args
 }
 
 impl InferenceEngine for RuntimeLlama {
@@ -1003,4 +1031,34 @@ fn build_chat_messages(messages: &[ChatMessage]) -> Result<Vec<OwnedChatMessage>
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_args_from_string() {
+        // C despeja `args` como string quando `tool.arguments` nao parseia.
+        let raw = json!({"name":"ask_agent","call_id":"x","command":"ask_agent",
+                         "args":"{\"name\": \"lucy\", \"prompt\": \"ok?\"}"});
+        let tool = tool_call_from_value(raw);
+        assert_eq!(tool.name, "ask_agent");
+        assert_eq!(tool.args["name"], "lucy");
+        assert_eq!(tool.args["prompt"], "ok?");
+
+        // String quebrada/embrulhada com texto solto: extrai o JSON no meio.
+        let raw = json!({"name":"ask_agent","args":"ANTES {\"name\":\"lucas\",\"prompt\":\"x\"} DEPOIS"});
+        let tool = tool_call_from_value(raw);
+        assert_eq!(tool.args["name"], "lucas");
+    }
+
+    #[test]
+    fn tool_call_wrapped_arguments() {
+        // Alguns templates embrulham os argumentos num objeto `arguments` interno.
+        let raw = json!({"name":"ask_agent","args":{"arguments":{"name":"lucy","prompt":"p"}}});
+        let tool = tool_call_from_value(raw);
+        assert_eq!(tool.args["arguments"]["name"], "lucy");
+    }
 }

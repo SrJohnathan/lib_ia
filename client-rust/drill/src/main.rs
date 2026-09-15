@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod history;
+mod provider;
 mod subagents;
 mod tools;
 mod tui;
@@ -180,6 +181,7 @@ fn resolve(cli: Cli) -> Effective {
         flash_attn,
         cache_type_k,
         cache_type_v,
+        ..
     } = config::load_or_create(&cfg_path).0;
 
     Effective {
@@ -208,28 +210,47 @@ fn resolve(cli: Cli) -> Effective {
 
 fn main() {
     let eff = resolve(Cli::parse());
+    let cfg = config::load_or_create(std::path::Path::new(&eff.config_path)).0;
 
+    let remote_only = cfg.provider == config::DEFAULT_PROVIDER_OPENAI;
     let mut engine = match build_engine(&eff) {
-        Ok(engine) => engine,
+        Ok(engine) => Some(engine),
         Err(err) => {
-            eprintln!("falha ao iniciar runtime: {}", err);
-            std::process::exit(1);
+            if remote_only {
+                eprintln!(
+                    "[drill] provider remoto ativo; sem modelo local, seguindo sem RuntimeLlama: {}",
+                    err
+                );
+                None
+            } else {
+                eprintln!("falha ao iniciar runtime: {}", err);
+                std::process::exit(1);
+            }
         }
     };
 
-    if eff.tools {
-        if let Err(err) = engine.set_tools_json(tools::TOOLS_JSON) {
-            eprintln!("set_tools_json falhou: {}", err);
-            std::process::exit(1);
+    if let Some(ref mut engine) = engine {
+        if eff.tools {
+            if let Err(err) = engine.set_tools_json(tools::TOOLS_JSON) {
+                eprintln!("set_tools_json falhou: {}", err);
+                std::process::exit(1);
+            }
         }
     }
 
     println!("[drill] carregando modelo... aguarde;\n  {} ({} camadas GPU, tools {}, config {})",
              eff.model, eff.ngl, if eff.tools { "on" } else { "off" }, eff.config_path);
 
-    let has_thinking = engine.supports_thinking().unwrap_or(false);
-    let engine = Arc::new(Mutex::new(engine));
+    let has_thinking = engine
+        .as_mut()
+        .and_then(|e| e.supports_thinking())
+        .unwrap_or(false);
+    let engine = engine.map(|e| Arc::new(Mutex::new(e)));
     let interrupt = Arc::new(AtomicBool::new(false));
+
+    // Provider compartilhado (TUI escolhe / worker executa). Subagentes não usam.
+    let provider_store = Arc::new(provider::ProviderStore::new(&cfg, eff.config_path.clone().into()));
+
     let mut agent = Agent::new(
         engine,
         eff.dir.clone(),
@@ -237,6 +258,9 @@ fn main() {
         eff.ctx,
         interrupt.clone(),
         eff.persona.clone(),
+        Arc::clone(&provider_store),
+        eff.temp,
+        eff.n_predict,
     );
 
     match eff.mode.as_str() {
@@ -244,7 +268,19 @@ fn main() {
         _ => {}
     }
 
-    agent.set_history(Arc::new(history::History::new(subagents::config_root())));
+    // Sessao: id unico por execucao, usado como chave da lista `/session`.
+    let session_id = format!(
+        "{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        std::process::id()
+    );
+    agent.set_session(session_id.clone());
+
+    let history = Arc::new(history::History::new(subagents::config_root()));
+    agent.set_history(Arc::clone(&history));
 
     let session = tui::SessionInfo::new(
         eff.model.clone(),
@@ -257,10 +293,14 @@ fn main() {
     let mut state = tui::AppState::new(session, interrupt);
     state.push(
         tui::Kind::Muted,
-        format!("modelo {} | ngl {} | tools: {} | raciocinio: {} | config {}",
+        format!("modelo {} | ngl {} | tools: {} | raciocinio: {} | provider {} | config {}",
                 eff.model, eff.ngl, if eff.tools { "on" } else { "off" },
-                if has_thinking { "on" } else { "off" }, eff.config_path),
+                if has_thinking { "on" } else { "off" }, agent.provider_summary(), eff.config_path),
     );
+
+    // Canal de permissao: tools sensiveis (ex.: fetch_url) bloqueiam a thread
+    // de geracao ate o usuario responder aqui.
+    let permission_rx = tools::install_permission_channel();
 
     if let Some(headless_prompt) = eff.headless.clone() {
         agent.set_event_sink(Arc::new(|ev: ManagerEvent| match ev {
@@ -283,6 +323,7 @@ fn main() {
                 eprintln!("\x1b[36mtrabalhando: {}\x1b[0m", name);
             }
         }));
+        spawn_headless_permission_responder(permission_rx);
         return run_headless(&mut agent, &headless_prompt);
     }
 
@@ -291,10 +332,24 @@ fn main() {
 
     thread::spawn(move || worker(&mut agent, turn_rx, ev_tx));
 
-    if let Err(err) = tui::run(state, ev_rx, turn_tx) {
+    if let Err(err) = tui::run(state, ev_rx, turn_tx, history, session_id, permission_rx) {
         eprintln!("tui error: {}", err);
         std::process::exit(1);
     }
+}
+
+/// Sem UI (modo `--headless`): pede permissao via stdin (y/N) numa thread a
+/// parte, ja que a thread principal fica bloqueada em `agent.run_turn`.
+fn spawn_headless_permission_responder(rx: Receiver<tools::PermissionRequest>) {
+    thread::spawn(move || {
+        for req in rx {
+            eprint!("\n\x1b[33m[permissao]\x1b[0m {} quer acessar: {} — permitir? [y/N] ", req.tool, req.detail);
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            let allow = matches!(line.trim().to_lowercase().as_str(), "y" | "yes" | "s" | "sim");
+            let _ = req.reply.send(allow);
+        }
+    });
 }
 
 fn run_headless(agent: &mut Agent, prompt: &str) {
@@ -310,12 +365,19 @@ fn run_headless(agent: &mut Agent, prompt: &str) {
 }
 
 fn build_engine(eff: &Effective) -> Result<RuntimeLlama, String> {
+    let model_path = std::path::Path::new(&eff.model);
+    if !model_path.exists() {
+        return Err(format!(
+            "modelo nao encontrado: {} — verifique o caminho no config.json (ou use --model)",
+            eff.model
+        ));
+    }
     let mut engine = RuntimeLlama::try_new(
         eff.model.clone(),
         eff.ctx,
         eff.n_predict,
-        512,
-        512,
+        128,
+        128,
         eff.temp,
         0.95,
         40,
@@ -391,6 +453,24 @@ fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<t
             agent::WorkerMsg::SetMode(mode) => {
                 agent.set_mode(mode);
                 send(tui::UiEvent::ModeChanged(mode));
+                continue;
+            }
+            agent::WorkerMsg::SetSession(id) => {
+                agent.set_session(id);
+                continue;
+            }
+            agent::WorkerMsg::SetProvider(kind) => {
+                match agent.switch_provider(kind) {
+                    Ok(summary) => send(tui::UiEvent::Muted(format!("[provider] {}", summary))),
+                    Err(err) => send(tui::UiEvent::Err(err)),
+                }
+                continue;
+            }
+            agent::WorkerMsg::ListModels => {
+                match agent.list_models_remote() {
+                    Ok(list) => send(tui::UiEvent::Muted(format!("[models]\n{}", list))),
+                    Err(err) => send(tui::UiEvent::Err(err)),
+                }
                 continue;
             }
             agent::WorkerMsg::Turn(input) => input,
