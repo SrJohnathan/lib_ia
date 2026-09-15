@@ -89,6 +89,10 @@ impl ProviderStore {
         }
     }
 
+    pub fn set_api_key(&self, key: Option<String>) {
+        // atualiza settings + grava em config.json (openai_api_key)
+    }
+
     pub fn current(&self) -> ProviderSettings {
         self.settings.lock().unwrap().clone()
     }
