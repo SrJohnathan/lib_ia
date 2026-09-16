@@ -507,6 +507,64 @@ fn text_of(message: &Value) -> String {
         .to_string()
 }
 
+/// Parte normalizada do `content` de uma mensagem do IR: texto ou imagem
+/// (data URI `data:<mime>;base64,...`).
+enum IrPart {
+    Text(String),
+    Image { mime: String, data: String },
+}
+
+/// Separa o `content` de uma mensagem do IR em partes (texto e imagens). O
+/// IR usa texto puro (`"...string..."`) ou um array de blocos OpenAI
+/// (`{"type":"text"}`, `{"type":"image_url","image_url":{"url":...}}`).
+fn ir_parts(message: &Value) -> Vec<IrPart> {
+    let content = message.get("content").unwrap_or(&Value::Null);
+    let mut out = Vec::new();
+    match content {
+        Value::String(s) => {
+            if !s.is_empty() {
+                out.push(IrPart::Text(s.clone()));
+            }
+        }
+        Value::Array(arr) => {
+            for block in arr {
+                match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                    "text" => {
+                        if let Some(t) = block.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                out.push(IrPart::Text(t.to_string()));
+                            }
+                        }
+                    }
+                    "image_url" => {
+                        let url = block
+                            .get("image_url")
+                            .and_then(|i| i.get("url"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if let Some((mime, data)) = split_data_uri(url) {
+                            out.push(IrPart::Image { mime, data });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Extrai `(mime, base64)` de uma data URI `data:<mime>;base64,<payload>`.
+fn split_data_uri(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (mime, payload) = rest.split_once(";base64,")?;
+    if mime.is_empty() || payload.is_empty() {
+        return None;
+    }
+    Some((mime.to_string(), payload.to_string()))
+}
+
 /// Payloads SSE (`data: ...`), ignorando `[DONE]`, eventos e vazios.
 fn sse_payloads(body: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -621,7 +679,25 @@ fn responses_input(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                 "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("")),
                 "output": text_of(m),
             })),
-            _ => input.push(json!({"role": role, "content": text_of(m)})),
+            _ => {
+                let mut text = String::new();
+                let mut images = Vec::new();
+                for part in ir_parts(m) {
+                    match part {
+                        IrPart::Text(t) => text.push_str(&t),
+                        IrPart::Image { mime, data } => images.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", mime, data),
+                        })),
+                    }
+                }
+                if !text.is_empty() {
+                    input.push(json!({"role": role, "content": text}));
+                }
+                for img in images {
+                    input.push(img);
+                }
+            }
         }
     }
     let instr = if instructions.is_empty() {
@@ -673,10 +749,25 @@ fn anthropic_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
                     "content": text_of(m),
                 }],
             })),
-            _ => out.push(json!({
-                "role": "user",
-                "content": [{"type": "text", "text": text_of(m)}],
-            })),
+            _ => {
+                let mut text = String::new();
+                let mut blocks = Vec::new();
+                for part in ir_parts(m) {
+                    match part {
+                        IrPart::Text(t) => text.push_str(&t),
+                        IrPart::Image { mime, data } => blocks.push(json!({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": data},
+                        })),
+                    }
+                }
+                if !text.is_empty() {
+                    blocks.insert(0, json!({"type": "text", "text": text}));
+                }
+                if !blocks.is_empty() {
+                    out.push(json!({"role": "user", "content": blocks}));
+                }
+            }
         }
     }
     let sys = if system.is_empty() {
@@ -743,10 +834,24 @@ fn google_contents(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
                     }],
                 }));
             }
-            _ => out.push(json!({
-                "role": "user",
-                "parts": [{"text": text_of(m)}],
-            })),
+            _ => {
+                let mut text = String::new();
+                let mut parts = Vec::new();
+                for part in ir_parts(m) {
+                    match part {
+                        IrPart::Text(t) => text.push_str(&t),
+                        IrPart::Image { mime, data } => parts.push(json!({
+                            "inlineData": {"mimeType": mime, "data": data},
+                        })),
+                    }
+                }
+                if !text.is_empty() {
+                    parts.insert(0, json!({"text": text}));
+                }
+                if !parts.is_empty() {
+                    out.push(json!({"role": "user", "parts": parts}));
+                }
+            }
         }
     }
     let sys = if system.is_empty() {
@@ -1309,4 +1414,70 @@ fn http_client() -> Result<reqwest::blocking::Client, String> {
         .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|err| format!("erro ao criar cliente HTTP: {}", err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img_msg(text: &str) -> Value {
+        json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
+            ],
+        })
+    }
+
+    #[test]
+    fn responses_translates_image() {
+        let (instructions, input) = responses_input(&[img_msg("veja isso")]);
+        assert!(instructions.is_none());
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "veja isso");
+        assert_eq!(input[1]["type"], "input_image");
+        assert_eq!(input[1]["image_url"], "data:image/png;base64,QUJDRA==");
+    }
+
+    #[test]
+    fn anthropic_translates_image() {
+        let (system, msgs) = anthropic_messages(&[img_msg("veja isso")]);
+        assert!(system.is_none());
+        assert_eq!(msgs.len(), 1);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "veja isso");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJDRA==");
+    }
+
+    #[test]
+    fn google_translates_image() {
+        let (system, contents) = google_contents(&[img_msg("veja isso")]);
+        assert!(system.is_none());
+        assert_eq!(contents.len(), 1);
+        let parts = contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "veja isso");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "QUJDRA==");
+    }
+
+    #[test]
+    fn text_content_unchanged_without_images() {
+        let msg = json!({"role": "user", "content": "soma dois mais dois"});
+        let (_, input) = responses_input(&[msg.clone()]);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["content"], "soma dois mais dois");
+        let (_, msgs) = anthropic_messages(&[msg.clone()]);
+        assert_eq!(msgs[0]["content"][0]["text"], "soma dois mais dois");
+        let (_, contents) = google_contents(&[msg]);
+        assert_eq!(contents[0]["parts"][0]["text"], "soma dois mais dois");
+    }
 }

@@ -1,7 +1,7 @@
 use crate::agent;
 use crate::history::{History, StoredSession};
 use crate::tools::PermissionRequest;
-use crate::tui::helpes::wrap_text;
+use crate::tui::helpers::{char_to_byte, centered_rect, wrap_text, draw_provider_overlay, draw_models_overlay};
 use crate::tui::highlight_code::CodeHighlighter;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -22,7 +22,8 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::tui::welcome::{draw_welcome};
 
-mod helpes;
+mod helpers;
+mod provider_ui;
 
 mod highlight_code;
 mod openia;
@@ -68,7 +69,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 /// Forca do raciocinio do overlay `/models` (label, valor enviado na API).
 /// Valor vazio = nao envia o campo (padrao do servidor).
-const REASONING_EFFORTS: &[(&str, &str)] = &[
+pub  const REASONING_EFFORTS: &[(&str, &str)] = &[
     ("padrao", ""),
     ("baixo", "low"),
     ("medio", "medium"),
@@ -117,8 +118,8 @@ pub enum ModelSetup {
     Mmproj { input: String, pos: usize },
 }
 
-/// Tipos de API suportados no wizard de adicionar provider cloud (`a` no
-/// overlay `/provider`), na ordem ciclada por Tab.
+/// Tipos de API suportados no wizard de adicionar provider cloud (Ctrl+A no
+/// overlay `/provider` → Cloud), na ordem ciclada por Tab.
 pub(crate) const CLOUD_KINDS: [crate::config::CloudKind; 3] = [
     crate::config::CloudKind::OpenAi,
     crate::config::CloudKind::Anthropic,
@@ -250,6 +251,8 @@ pub struct AppState {
     /// Overlay `/provider` (escolha do provider ativo). So o Root (solo/maestro).
     pub provider_view: bool,
     pub provider_cursor: usize,
+    /// Nivel de navegacao do overlay /provider (Root | LocalList | CloudList).
+    pub provider_nav: provider_ui::ProviderNav,
     /// Providers disponiveis (local + cloud), atualizados via
     /// `UiEvent::Providers`.
     pub providers: Vec<crate::provider::ProviderEntry>,
@@ -321,6 +324,7 @@ impl AppState {
             session_scroll: 0,
             provider_view: false,
             provider_cursor: 0,
+            provider_nav: provider_ui::ProviderNav::Root,
             providers: Vec::new(),
             provider_selected: None,
             models_view: false,
@@ -1105,16 +1109,20 @@ fn loop_result(
 
                     if let Some(action) = read_key(key, state) {
                         match action {
-                            Action::ChooseProvider => {
-                                if let Some(entry) = state.providers.get(state.provider_cursor) {
-                                    let id = entry.id.clone();
-                                    state.provider_view = false;
-                                    state.status = "definindo provider...".to_string();
-                                    let _ = turns.send(agent::WorkerMsg::SetProvider(id));
-                                } else {
-                                    state.provider_view = false;
-                                    state.status = "nenhum provider configurado".to_string();
-                                }
+                            Action::ChooseProviderId(id) => {
+                                state.provider_view = false;
+                                state.provider_nav = provider_ui::ProviderNav::Root;
+                                state.status = "definindo provider...".to_string();
+                                let _ = turns.send(agent::WorkerMsg::SetProvider(id));
+                            }
+                            Action::OpenLocalModelSetup => {
+                                // Fecha o overlay e abre o modal de GGUF existente.
+                                state.provider_view = false;
+                                state.provider_nav = provider_ui::ProviderNav::Root;
+                                let model = state.session.model.clone();
+                                let mmproj = state.local_mmproj.clone();
+                                state.open_model_setup(model, mmproj);
+                                state.status = "configure o modelo local (GGUF)...".to_string();
                             }
 
                             Action::Quit => return Ok(()),
@@ -1136,7 +1144,7 @@ fn loop_result(
                             Action::ProviderSetupCancel => {
                                 state.provider_setup = None;
                                 state.status =
-                                    "provider cloud nao adicionado; 'a' adiciona".to_string();
+                                    "provider cloud nao adicionado; Ctrl+A adiciona".to_string();
                             }
                             Action::NavSession(delta) => {
                                 let len = state.sessions.len() as isize;
@@ -1169,6 +1177,8 @@ fn loop_result(
                             }
                             Action::CloseProviderView => {
                                 state.provider_view = false;
+                                state.provider_nav = provider_ui::ProviderNav::Root;
+                                state.provider_cursor = 0;
                                 state.status = "ready".to_string();
                             }
                             Action::ChooseModel => {
@@ -1205,7 +1215,8 @@ fn loop_result(
                                     "/provider" => {
                                         state.provider_view = true;
                                         state.provider_cursor = 0;
-                                        state.status = "escolha o provider...".to_string();
+                                        state.provider_nav = provider_ui::ProviderNav::Root;
+                                        state.status = "escolha Local ou Cloud...".to_string();
                                         continue;
                                     }
                                     "/models" => {
@@ -1289,10 +1300,39 @@ fn loop_result(
                     _ => {}
                 },
                 Event::Paste(text) => {
-                    if state.pending_permission.is_none()
-                        && !state.session_view
-                        && state.model_setup.is_none()
-                    {
+                    if state.pending_permission.is_some() || state.session_view {
+                        // não cola em overlays de permissão/sessão
+                    } else if state.provider_setup.is_some() {
+                        // cola no campo atual do wizard de cloud
+                        let sanitized: String = text
+                            .chars()
+                            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                            .collect();
+                        if !sanitized.is_empty() {
+                            provider_setup_edit(state, |input, pos| {
+                                let byte = char_to_byte(input, *pos);
+                                input.insert_str(byte, &sanitized);
+                                *pos += sanitized.chars().count();
+                            });
+                        }
+                    } else if state.model_setup.is_some() {
+                        // cola no campo do modal de modelo local
+                        let sanitized: String = text
+                            .chars()
+                            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                            .collect();
+                        if !sanitized.is_empty() {
+                            match state.model_setup.as_mut() {
+                                Some(ModelSetup::Gguf { input, pos, .. })
+                                | Some(ModelSetup::Mmproj { input, pos }) => {
+                                    let byte = char_to_byte(input, *pos);
+                                    input.insert_str(byte, &sanitized);
+                                    *pos += sanitized.chars().count();
+                                }
+                                None => {}
+                            }
+                        }
+                    } else {
                         insert_text_at_cursor(state, &text);
                         state.update_popup();
                     }
@@ -1314,20 +1354,23 @@ enum Action {
     OpenSession,
     DeleteSession,
     CloseSessionView,
-    ChooseProvider,
+    ChooseProviderId(String),
     CloseProviderView,
+    /// Ctrl+A na lista Local: abre modal de GGUF.
+    OpenLocalModelSetup,
     ChooseModel,
     CloseModelsView,
     /// Enter no modal de configuracao do modelo local.
     SetupConfirm,
     /// Esc no modal de configuracao do modelo local.
     SetupCancel,
-    /// `a` no overlay `/provider`: abre o wizard de adicionar provider cloud.
+    /// Ctrl+A na lista Cloud: abre o wizard de adicionar provider cloud.
     OpenProviderSetup,
     /// Enter no wizard de provider cloud: avanca etapa ou cria o provider.
     ProviderSetupConfirm,
     /// Esc no wizard de provider cloud: cancela.
     ProviderSetupCancel,
+
 }
 
 fn read_key(key: KeyEvent, state: &mut AppState) -> Option<Action> {
@@ -1402,6 +1445,31 @@ fn read_key(key: KeyEvent, state: &mut AppState) -> Option<Action> {
     // Wizard de adicionar provider cloud (aberto pelo overlay /provider).
     if state.provider_setup.is_some() {
         return match key.code {
+            // Navegação do tipo de API (Kind) — setas / j/k / Tab
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                if let Some(ProviderSetup::Kind { pos }) = state.provider_setup.as_mut() {
+                    *pos = if *pos == 0 {
+                        CLOUD_KINDS.len() - 1
+                    } else {
+                        *pos - 1
+                    };
+                }
+                None
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                if let Some(ProviderSetup::Kind { pos }) = state.provider_setup.as_mut() {
+                    *pos = (*pos + 1) % CLOUD_KINDS.len();
+                }
+                None
+            }
+            KeyCode::Tab => {
+                if let Some(ProviderSetup::Kind { pos }) = state.provider_setup.as_mut() {
+                    *pos = (*pos + 1) % CLOUD_KINDS.len();
+                }
+                None
+            }
+
+            // Edição de texto (BaseUrl / Model / ApiKey)
             KeyCode::Char(c) => {
                 provider_setup_edit(state, |input, pos| {
                     let byte = char_to_byte(input, *pos);
@@ -1455,12 +1523,7 @@ fn read_key(key: KeyEvent, state: &mut AppState) -> Option<Action> {
                 provider_setup_edit(state, |input, pos| *pos = input.chars().count());
                 None
             }
-            KeyCode::Tab => {
-                if let Some(ProviderSetup::Kind { pos }) = state.provider_setup.as_mut() {
-                    *pos = (*pos + 1) % CLOUD_KINDS.len();
-                }
-                None
-            }
+
             KeyCode::Enter => Some(Action::ProviderSetupConfirm),
             KeyCode::Esc => Some(Action::ProviderSetupCancel),
             _ => None,
@@ -1485,24 +1548,44 @@ fn read_key(key: KeyEvent, state: &mut AppState) -> Option<Action> {
             _ => None,
         };
     }
-    // Overlay `/provider`: escolhe o provider ativo (local/cloud). Enter define.
+    // Overlay `/provider`: hierarquia Root → Local/Cloud list.
+    // 'a' solto NAO faz nada (evita bug ao digitar). Ctrl+A adiciona no contexto.
     if state.provider_view {
-        return match key.code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
-                state.provider_cursor = state.provider_cursor.saturating_sub(1);
+        use provider_ui::ProviderKeyResult;
+        let result = provider_ui::handle_key(
+            key.code,
+            key.modifiers,
+            state.provider_nav,
+            &mut state.provider_cursor,
+            &state.providers,
+        );
+        return match result {
+            ProviderKeyResult::None => None,
+            ProviderKeyResult::Close => Some(Action::CloseProviderView),
+            ProviderKeyResult::Back => {
+                state.provider_nav = provider_ui::ProviderNav::Root;
+                state.provider_cursor = 0;
+                state.status = "escolha Local ou Cloud...".to_string();
                 None
             }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
-                let max = state.providers.len().saturating_sub(1);
-                state.provider_cursor = (state.provider_cursor + 1).min(max);
+            ProviderKeyResult::EnterGroup(nav) => {
+                state.provider_nav = nav;
+                state.provider_cursor = 0;
+                state.status = match nav {
+                    provider_ui::ProviderNav::LocalList => "providers locais...".to_string(),
+                    provider_ui::ProviderNav::CloudList => "providers cloud...".to_string(),
+                    _ => "escolha o provider...".to_string(),
+                };
                 None
             }
-            KeyCode::Enter => Some(Action::ChooseProvider),
-            KeyCode::Char('a') | KeyCode::Char('A') => Some(Action::OpenProviderSetup),
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-                Some(Action::CloseProviderView)
+            ProviderKeyResult::Choose(id) => Some(Action::ChooseProviderId(id)),
+            ProviderKeyResult::Add => {
+                if matches!(state.provider_nav, provider_ui::ProviderNav::CloudList) {
+                    Some(Action::OpenProviderSetup)
+                } else {
+                    Some(Action::OpenLocalModelSetup)
+                }
             }
-            _ => None,
         };
     }
     // Overlay `/models`: escolhe modelo (j/k) e forca do raciocinio
@@ -1672,12 +1755,6 @@ fn read_key(key: KeyEvent, state: &mut AppState) -> Option<Action> {
     action
 }
 
-fn char_to_byte(text: &str, char_pos: usize) -> usize {
-    text.char_indices()
-        .nth(char_pos)
-        .map(|(byte, _)| byte)
-        .unwrap_or(text.len())
-}
 
 /// Edita o campo do modal de configuracao ativo (GGUF ou mmproj).
 fn setup_edit(state: &mut AppState, f: impl FnOnce(&mut String, &mut usize)) {
@@ -2300,236 +2377,10 @@ fn draw_session_overlay(frame: &mut Frame, state: &mut AppState) {
     );
 }
 
-fn draw_provider_overlay(frame: &mut Frame, state: &mut AppState) {
-    let area = centered_rect(72, 44, frame.area());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(COLOR_ACCENT))
-        .style(Style::default().bg(COLOR_CARD_BG))
-        .title(Line::from(Span::styled(
-            " Providers ( /provider ) ",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        )));
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "O provider so vale para o ROOT (solo/maestro). Subagentes continuam",
-        Style::default().fg(COLOR_TEXT_MUTED),
-    )));
-    lines.push(Line::from(Span::styled(
-        "sempre no runtime local.",
-        Style::default().fg(COLOR_TEXT_MUTED),
-    )));
-    lines.push(Line::from(""));
 
-    if state.providers.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (nenhum provider configurado)",
-            Style::default().fg(COLOR_TEXT_MUTED),
-        )));
-    }
 
-    let mut last_group: Option<bool> = None;
-    for (i, entry) in state.providers.iter().enumerate() {
-        if last_group != Some(entry.cloud) {
-            lines.push(Line::from(Span::styled(
-                if entry.cloud {
-                    "  -- cloud --"
-                } else {
-                    "  -- local --"
-                },
-                Style::default().fg(COLOR_TEXT_MUTED),
-            )));
-            last_group = Some(entry.cloud);
-        }
-        let cursor = i == state.provider_cursor;
-        let active = state.provider_selected.as_deref() == Some(entry.id.as_str());
-        let name_style = if cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else if active {
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(COLOR_TEXT_MAIN)
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {} {}{}",
-                if cursor { "»" } else { " " },
-                entry.name,
-                if active { "  (ativo)" } else { "" }
-            ),
-            name_style,
-        )));
-        lines.push(Line::from(Span::styled(
-            format!("      {}", entry.detail),
-            Style::default().fg(COLOR_TEXT_MUTED),
-        )));
-    }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  a: ", Style::default().fg(COLOR_ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            "adicionar provider cloud (openai / anthropic / google)",
-            Style::default().fg(COLOR_TEXT_MAIN),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "j/k ou setas: navegar   ",
-            Style::default().fg(COLOR_TEXT_MUTED),
-        ),
-        Span::styled(
-            "Enter: usar",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("   q/Esc: fechar", Style::default().fg(COLOR_TEXT_MUTED)),
-    ]));
-
-    let list = Paragraph::new(lines)
-        .wrap(ratatui::widgets::Wrap { trim: true })
-        .style(Style::default().bg(COLOR_CARD_BG));
-    frame.render_widget(list, inner);
-}
-
-fn draw_models_overlay(frame: &mut Frame, state: &mut AppState) {
-    let area = centered_rect(72, 62, frame.area());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(COLOR_ACCENT))
-        .style(Style::default().bg(COLOR_CARD_BG))
-        .title(Line::from(Span::styled(
-            " Modelos da API ( /models ) ",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        )));
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-
-    if state.models.is_empty() {
-        let msg = Paragraph::new(Line::from(Span::styled(
-            "(carregando modelos...)",
-            Style::default().fg(COLOR_TEXT_MUTED),
-        )))
-        .style(Style::default().bg(COLOR_CARD_BG));
-        frame.render_widget(msg, Rect::new(inner.x, inner.y + 1, inner.width, 3));
-        return;
-    }
-
-    // Area do footer (raciocinio + hints) = 4 linhas.
-    let list_height = inner.height.saturating_sub(4) as usize;
-    if state.models_cursor < state.models_scroll {
-        state.models_scroll = state.models_cursor;
-    } else if list_height > 0 && state.models_cursor >= state.models_scroll + list_height {
-        state.models_scroll = state.models_cursor + 1 - list_height;
-    }
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let start = state.models_scroll;
-    let end = (state.models_scroll + list_height).min(state.models.len());
-    for i in start..end {
-        let selected = i == state.models_cursor;
-        let is_current = state.models[i] == state.models_current;
-        let style = if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else if is_current {
-            Style::default().fg(COLOR_ACCENT)
-        } else {
-            Style::default().fg(COLOR_TEXT_MAIN)
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {} {} {}",
-                if selected { "»" } else { " " },
-                state.models[i],
-                if is_current { "(atual)" } else { "" }
-            ),
-            style,
-        )));
-    }
-    // Garante o espaco do footer dentro da janela de rolagem.
-    for _ in end..(start + list_height).min(state.models.len()) {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(""));
-
-    let mut effort_line = Line::from(vec![Span::styled(
-        "  raciocinio: ",
-        Style::default().fg(COLOR_TEXT_MUTED),
-    )]);
-    for (i, (label, _)) in REASONING_EFFORTS.iter().enumerate() {
-        let sel = i == state.effort_cursor;
-        let style = if sel {
-            Style::default()
-                .fg(Color::Black)
-                .bg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(COLOR_TEXT_MAIN)
-        };
-        effort_line.spans.push(Span::styled(format!(" {} ", label), style));
-        effort_line.spans.push(Span::styled(" ", Style::default()));
-    }
-    lines.push(effort_line);
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "j/k: modelo   ",
-            Style::default().fg(COLOR_TEXT_MUTED),
-        ),
-        Span::styled(
-            "h/l: raciocinio   ",
-            Style::default().fg(COLOR_TEXT_MUTED),
-        ),
-        Span::styled(
-            "Enter: definir",
-            Style::default()
-                .fg(COLOR_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("   q/Esc: fechar", Style::default().fg(COLOR_TEXT_MUTED)),
-    ]));
-
-    let list = Paragraph::new(lines)
-        .wrap(ratatui::widgets::Wrap { trim: true })
-        .style(Style::default().bg(COLOR_CARD_BG));
-    frame.render_widget(list, inner);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ]);
-    let vertical = popup_layout.split(area);
-    let horizontal = Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ]);
-    horizontal.split(vertical[1])[1]
-}
 
 fn help_text() -> String {
     "atalhos:\n\

@@ -2087,6 +2087,7 @@ name = "drill"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "base64 0.22.1",
  "crossterm",
  "futures",
  "lancedb",

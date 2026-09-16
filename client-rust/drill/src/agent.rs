@@ -1,11 +1,12 @@
 use crate::history::History;
 use crate::provider::{self, ProviderStore, Selected};
+use base64::Engine as _;
 use lib_rust::agents::{AgentMode, AgentOrchestrator, EventSink, TurnResult, MAESTRO_AGENT_ID};
 use lib_rust::RuntimeLlama;
-use serde_json::Value;
-use std::path::PathBuf;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub type Mode = AgentMode;
 
@@ -44,11 +45,56 @@ pub fn cancel_generation() {
 pub struct Agent {
     orchestrator: AgentOrchestrator,
     pub provider: Arc<ProviderStore>,
+    /// Engine local (RuntimeLlama) — espelho do que a fila usa; permite anexar
+    /// imagens (add_media_file) antes do turno local. `None` = sem runtime.
+    engine: Option<Arc<Mutex<RuntimeLlama>>>,
+    /// Diretorio de trabalho: resolve as mencoes `@arquivo` do prompt.
+    project_dir: PathBuf,
+}
+
+/// Imagem resolvida de uma menção `@arquivo` no prompt.
+struct PublishedImage {
+    /// Token como apareceu no prompt (ex.: `rel/foto.png`).
+    display: String,
+    /// Caminho absoluto do arquivo.
+    path: PathBuf,
+    mime: String,
+    base64: String,
+}
+
+/// Resultado do preparo de um turno: prompt final + imagens anexáveis.
+struct PreparedTurn {
+    prompt: String,
+    /// Imagens que serao anexadas ao modelo (multimodal ativo).
+    images: Vec<PublishedImage>,
+    /// Avisos de imagem enviados à UI (anexadas ou ignoradas).
+    ui_notices: Vec<String>,
+}
+
+const IMAGE_EXTS: [&str; 3] = ["png", "jpg", "jpeg"];
+
+fn is_image_ext(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn mime_of(name: &str) -> String {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext.to_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg".to_string(),
+        _ => "image/png".to_string(),
+    }
 }
 
 impl Agent {
     pub fn new(
-        engine: Option<Arc<std::sync::Mutex<RuntimeLlama>>>,
+        engine: Option<Arc<Mutex<RuntimeLlama>>>,
         project_dir: PathBuf,
         tools_enabled: bool,
         ctx_max: usize,
@@ -59,8 +105,8 @@ impl Agent {
         n_predict: usize,
     ) -> Self {
         let orchestrator = AgentOrchestrator::new(
-            engine,
-            project_dir,
+            engine.clone(),
+            project_dir.clone(),
             tools_enabled,
             ctx_max,
             interrupt,
@@ -72,6 +118,8 @@ impl Agent {
         Self {
             orchestrator,
             provider,
+            engine,
+            project_dir,
         }
     }
 
@@ -109,11 +157,27 @@ impl Agent {
     }
 
     /// Turno unico para solo e agentes: enfileira no root (local) ou resolve na
-    /// API remota, conforme o provider ativo (`/provider`).
-    pub fn run_turn(&mut self, user_input: &str) -> Result<TurnResult, String> {
+    /// API remota, conforme o provider ativo (`/provider`). Retorna o resultado
+    /// e avisos de anexos de imagem (anexadas ou ignoradas) para a UI.
+    pub fn run_turn(
+        &mut self,
+        user_input: &str,
+    ) -> Result<(TurnResult, Vec<String>), String> {
         match self.provider.current() {
-            Selected::Local(_) => self.orchestrator.run_turn(user_input),
+            Selected::Local(p) => {
+                let multimodal = self.engine.is_some() && !p.mmproj.trim().is_empty();
+                let prep = self.prepare_turn(user_input, multimodal);
+                if !prep.images.is_empty() {
+                    self.attach_local_media(&prep.images)?;
+                }
+                let result = self.orchestrator.run_turn(&prep.prompt);
+                if !prep.images.is_empty() {
+                    self.detach_local_media();
+                }
+                Ok((result?, prep.ui_notices))
+            }
             Selected::Cloud(cloud) => {
+                let prep = self.prepare_turn(user_input, true);
                 let tools: Value = if self.orchestrator.tools_enabled() {
                     serde_json::from_str(lib_rust::tools::TOOLS_JSON).unwrap_or(Value::Null)
                 } else {
@@ -126,14 +190,132 @@ impl Agent {
                     self.orchestrator.n_predict(),
                     Arc::clone(self.orchestrator.interrupt()),
                 );
-                self.orchestrator.manager().run_remote_turn(
+                let media: Vec<Value> = prep
+                    .images
+                    .iter()
+                    .map(|img| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", img.mime, img.base64),
+                            },
+                        })
+                    })
+                    .collect();
+                let result = self.orchestrator.manager().run_remote_turn(
                     MAESTRO_AGENT_ID,
-                    user_input,
+                    &prep.prompt,
                     "root",
                     true,
+                    &media,
                     generator.as_ref(),
-                )
+                );
+                Ok((result?, prep.ui_notices))
             }
+        }
+    }
+
+    /// Anexa as imagens resolvidas ao engine local (runtime) antes do turno.
+    fn attach_local_media(&self, images: &[PublishedImage]) -> Result<(), String> {
+        let Some(engine) = &self.engine else {
+            return Ok(());
+        };
+        let mut guard = engine.lock().map_err(|e| e.to_string())?;
+        let _ = guard.clear_media();
+        for img in images {
+            guard
+                .add_media_file(&img.path.display().to_string())
+                .map_err(|err| format!("falha ao anexar imagem {}: {}", img.display, err))?;
+        }
+        Ok(())
+    }
+
+    /// Remove os anexos do engine local apos o turno.
+    fn detach_local_media(&self) {
+        if let Some(engine) = &self.engine {
+            let _ = engine.lock().map(|mut g| g.clear_media());
+        }
+    }
+
+    /// Resolve um caminho de menção `@arquivo` (relativo ao diretorio de
+    /// trabalho, ou absoluto) e confirma que o arquivo existe.
+    fn resolve_mention(&self, token: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(token);
+        let candidate = if p.is_absolute() {
+            p
+        } else {
+            self.project_dir.join(&p)
+        };
+        candidate.is_file().then_some(candidate)
+    }
+
+    /// Varre o input em busca de menções `@arquivo`:
+    /// - não-imagem (ou inexistente): mantém o token literal (fluxo atual);
+    /// - imagem + multimodal ativo: anexa ao modelo (local/cloud);
+    /// - imagem + multimodal desativado: mantém o token e injeta um aviso no
+    ///   prompt (a imagem não é enviada).
+    fn prepare_turn(&self, user_input: &str, multimodal: bool) -> PreparedTurn {
+        const AVISO: &str = "[AVISO] O usuario anexou imagens que o modelo atual NAO processa \
+                             (multimodal desativado); elas nao foram enviadas ao modelo:";
+        let mut prompt = String::with_capacity(user_input.len() + 128);
+        let mut images = Vec::new();
+        let mut ui_notices = Vec::new();
+        let mut skipped = Vec::new();
+
+        let chars: Vec<char> = user_input.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '@' {
+                prompt.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < chars.len() && !chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j == i + 1 || chars[i + 1] == '@' {
+                prompt.push('@');
+                i += 1;
+                continue;
+            }
+            let token: String = chars[i + 1..j].iter().collect();
+            let rel: String = chars[i..j].iter().collect();
+            let is_image = is_image_ext(&token) && self.resolve_mention(&token).is_some();
+            if is_image && multimodal {
+                if let Some(path) = self.resolve_mention(&token) {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    images.push(PublishedImage {
+                        display: token.clone(),
+                        mime: mime_of(&token),
+                        base64,
+                        path,
+                    });
+                    ui_notices
+                        .push(format!("imagem adicionada ao contexto: {}", token));
+                }
+            } else if is_image {
+                skipped.push(token.clone());
+                ui_notices
+                    .push(format!("imagem ignorada (modelo sem suporte a imagens): {}", token));
+            }
+            prompt.push_str(&rel);
+            i = j;
+        }
+
+        if !skipped.is_empty() {
+            prompt.push('\n');
+            prompt.push_str(AVISO);
+            prompt.push(' ');
+            prompt.push_str(&skipped.join(", "));
+            prompt.push('.');
+        }
+
+        PreparedTurn {
+            prompt,
+            images,
+            ui_notices,
         }
     }
 
@@ -146,6 +328,13 @@ impl Agent {
     /// adota o primeiro id de `/models`.
     pub fn switch_provider(&self, uuid: String) -> Result<String, String> {
         self.provider.select(&uuid)?;
+
+        // Solo + cloud: não faz sentido manter o GGUF na memória
+        if self.provider.is_cloud() && matches!(self.mode(), Mode::Solo) {
+            cancel_generation();
+            self.orchestrator.manager().unload_engine();
+        }
+
         if let Some(cloud) = self.provider.selected_cloud() {
             if cloud.model.trim().is_empty() {
                 let models = provider::list_models(&cloud)?;
@@ -154,13 +343,18 @@ impl Agent {
                 self.provider
                     .set_model_and_effort(picked.clone(), cloud.reasoning_effort.clone())?;
                 return Ok(format!(
-                    "{} (modelo '{}' adotado de /models)\n{}",
+                    "{} (modelo '{}' adotado de /models; local descarregado)\n{}",
                     self.provider_summary(),
                     picked,
                     models.join("\n")
                 ));
             }
+            return Ok(format!(
+                "{} (modelo local descarregado)",
+                self.provider_summary()
+            ));
         }
+
         Ok(self.provider_summary())
     }
 
@@ -187,7 +381,7 @@ impl Agent {
     /// no AgentManager (se ainda nao estiver rodando). Tambem persiste no
     /// config.json. Retorna (modelo, has_thinking).
     pub fn set_local_model(
-        &self,
+        &mut self,
         model: String,
         mmproj: String,
         params: &crate::EngineParams,
@@ -199,7 +393,8 @@ impl Agent {
                 .map_err(|err| err.to_string())?;
         }
         let has_thinking = engine.supports_thinking().unwrap_or(false);
-        let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
+        let engine = Arc::new(Mutex::new(engine));
+        self.engine = Some(Arc::clone(&engine));
         self.orchestrator.manager().install_engine(engine);
         self.provider.set_local_model(model.clone(), mmproj)?;
         Ok((model, has_thinking))
@@ -275,6 +470,82 @@ mod tests {
         let agent = make_agent(&path, &dir);
         assert!(!agent.provider.is_cloud());
         assert!(agent.provider_summary().contains("local"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_img(dir: &std::path::Path, name: &str, bytes: &[u8]) {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+
+    #[test]
+    fn mention_non_image_stays_literal() {
+        let (dir, path) = temp_config("img1", false);
+        let agent = make_agent(&path, &dir);
+        std::fs::write(dir.join("main.rs"), b"fn main() {}").unwrap();
+        let prep = agent.prepare_turn("leia @main.rs e me diga", true);
+        assert!(prep.prompt.contains("@main.rs"));
+        assert!(prep.images.is_empty());
+        assert!(prep.ui_notices.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_image_multimodal_attaches() {
+        let (dir, path) = temp_config("img2", false);
+        let agent = make_agent(&path, &dir);
+        write_img(&dir, "foto.png", b"\x89PNG fake bytes");
+        let prep = agent.prepare_turn("descreva @foto.png", true);
+        assert!(prep.prompt.contains("@foto.png"), "prompt={}", prep.prompt);
+        assert_eq!(prep.images.len(), 1);
+        let img = &prep.images[0];
+        assert_eq!(img.mime, "image/png");
+        assert_eq!(
+            img.base64,
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG fake bytes")
+        );
+        assert!(img.path.is_file());
+        assert_eq!(prep.ui_notices.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_image_no_multimodal_injects_notice() {
+        let (dir, path) = temp_config("img3", false);
+        let agent = make_agent(&path, &dir);
+        write_img(&dir, "foto.png", b"\x89PNG fake bytes");
+        let prep = agent.prepare_turn("descreva @foto.png", false);
+        assert!(prep.images.is_empty());
+        assert!(prep.prompt.contains("@foto.png"));
+        assert!(
+            prep.prompt.contains("[AVISO]"),
+            "prompt deveria conter aviso: {}",
+            prep.prompt
+        );
+        assert_eq!(prep.ui_notices.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_missing_image_treated_as_text() {
+        let (dir, path) = temp_config("img4", false);
+        let agent = make_agent(&path, &dir);
+        let prep = agent.prepare_turn("e se @naoexiste.png?", true);
+        assert!(prep.prompt.contains("@naoexiste.png"));
+        assert!(prep.images.is_empty());
+        assert!(prep.ui_notices.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mention_jpeg_and_uppercase_ext() {
+        let (dir, path) = temp_config("img5", false);
+        let agent = make_agent(&path, &dir);
+        write_img(&dir, "foto.JPG", b"jpeg bytes");
+        write_img(&dir, "scan.jpeg", b"jpeg bytes 2");
+        let prep = agent.prepare_turn("veja @foto.JPG e @scan.jpeg", true);
+        assert_eq!(prep.images.len(), 2);
+        assert!(prep.images.iter().all(|i| i.mime == "image/jpeg"));
+        assert_eq!(prep.ui_notices.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

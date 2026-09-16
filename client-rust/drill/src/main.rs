@@ -414,7 +414,10 @@ fn spawn_headless_permission_responder(rx: Receiver<tools::PermissionRequest>) {
 
 fn run_headless(agent: &mut Agent, prompt: &str) {
     match agent.run_turn(prompt) {
-        Ok(turn) => {
+        Ok((turn, notices)) => {
+            for notice in notices {
+                eprintln!("\x1b[90m[imagem] {}\x1b[0m", notice);
+            }
             println!();
             if let (Some(tokens), Some(tps)) = (turn.tokens, turn.tps) {
                 eprintln!("\x1b[90m[{:.1} tok/s, {} tokens]\x1b[0m", tps, tokens);
@@ -654,7 +657,10 @@ fn worker(
         let result = agent.run_turn(&input);
 
         match result {
-            Ok(turn) => {
+            Ok((turn, notices)) => {
+                for notice in notices {
+                    send(tui::UiEvent::Muted(format!("[imagem] {}", notice)));
+                }
                 if let (Some(tokens), Some(tps)) = (turn.tokens, turn.tps) {
                     send(tui::UiEvent::Stats { tokens, tps });
                 }

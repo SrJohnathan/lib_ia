@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use crate::InferenceEngine;
 
 /// Rounds maximos do loop de ferramentas de um agente com tools habilitadas.
 const MAX_TOOL_ROUNDS: usize = 8;
@@ -137,6 +138,37 @@ impl AgentManager {
 
     pub fn set_executor(&self, executor: ToolExecutor) {
         *self.executor.lock().unwrap() = Some(executor);
+    }
+
+
+    /// Descarrega o modelo local (libera VRAM) e esquece o engine.
+    /// Libera VRAM, mas mantém o RuntimeLlama (params) para poder dar load de novo.
+    pub fn unload_engine(&self) {
+        crate::RuntimeLlama::cancel_all_generations();
+        if let Some(engine) = self.engine.lock().unwrap().as_ref() {
+            if let Ok(mut rt) = engine.lock() {
+                rt.unload();
+            }
+        }
+
+    }
+
+    /// Recarrega o GGUF no engine já instalado (após unload).
+    pub fn load_engine(&self) -> Result<(), String> {
+        let guard = self.engine.lock().unwrap();
+        let Some(engine) = guard.as_ref() else {
+            return Err("nenhum engine local; use /model para carregar um GGUF".into());
+        };
+        let mut rt = engine.lock().map_err(|e| e.to_string())?;
+        rt.load().map_err(|e| e.to_string())
+    }
+
+    pub fn is_engine_loaded(&self) -> bool {
+        self.engine
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.lock().map(|r| r.is_loaded()).unwrap_or(false)))
+            .unwrap_or(false)
     }
 
     pub fn set_event_sink(&self, sink: EventSink) {
@@ -580,6 +612,11 @@ impl AgentManager {
     ///
     /// Roda NA thread do chamador (nao enfileira): o worker da fila segue livre
     /// para subagentes inline (ask_agent) no engine local.
+    ///
+    /// `media` recebe partes de imagem no shape OpenAI
+    /// (`{"type":"image_url","image_url":{"url":"data:...;base64,..."}}`); quando
+    /// nao vazio, o content da mensagem de usuario vira um array de partes
+    /// (texto + imagens) e cada gerador traduz para o wire do seu vendor.
     #[allow(clippy::too_many_arguments)]
     pub fn run_remote_turn(
         &self,
@@ -587,6 +624,7 @@ impl AgentManager {
         input: &str,
         kind: &str,
         stream_events: bool,
+        media: &[Value],
         generate: &dyn Fn(
             Vec<Value>,
             &mut dyn FnMut(RemoteEvent),
@@ -620,9 +658,12 @@ impl AgentManager {
         });
 
         // Mensagens no formato OpenAI a partir do historico vivo do agente.
+        // A ultima mensagem e o input do usuario atual: se houver anexos de
+        // imagem, o content vira um array de partes (texto + image_url).
         let mut messages: Vec<Value> = state
             .history
             .iter()
+            .take(state.history.len().saturating_sub(1))
             .map(|m| {
                 json!({
                     "role": m.role,
@@ -630,6 +671,24 @@ impl AgentManager {
                 })
             })
             .collect();
+        let last = state.history.last().cloned().unwrap_or_else(|| ChatMessage {
+            role: "user".to_string(),
+            content: input.to_string(),
+            reasoning_content: None,
+        });
+        if media.is_empty() {
+            messages.push(json!({
+                "role": last.role,
+                "content": last.content,
+            }));
+        } else {
+            let mut content = vec![json!({"type": "text", "text": last.content})];
+            content.extend(media.iter().cloned());
+            messages.push(json!({
+                "role": last.role,
+                "content": Value::Array(content),
+            }));
+        }
 
         let use_tools_any = state.config.tools_json.is_some();
         let limit = if use_tools_any {
