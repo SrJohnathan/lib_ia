@@ -1,172 +1,336 @@
-//! Provider do Root (solo/maestro). Dois provedores:
+//! Providers do Root (solo/maestro).
 //!
-//! - `Local`  — llama.cpp nativo (RuntimeLlama) carregado no processo.
-//! - `OpenAi` — qualquer API OpenAI-compativel (`/v1/chat/completions`),
-//!   incluindo OpenAI, Ollama, LM Studio, llama.cpp server, vLLM, etc.
+//! O config define uma lista de providers locais (llama.cpp nativo) e remotos
+//! (`type-url`: openai/anthropic/google). O `provider-selected-uuid` escolhe o
+//! ativo; a troca e feita pelo overlay `/provider` e persistida no config.json.
 //!
-//! Subagentes NAO seguem o provider: nao importam esta escolha e rodam sempre
-//! no runtime local (queru `ask_agent`, quer modo solo/maestro).
+//! Subagentes NAO seguem o provider: rodam sempre no runtime local.
+//!
+//! O contrato remoto da lib-rust e agnostico de vendor: um closure
+//! `Fn(Vec<Value>, &mut dyn FnMut(RemoteEvent)) -> RemoteModelOutput` recebe o
+//! historico no shape OpenAI (IR) e cada generator traduz para o wire do seu
+//! vendor. Nada na lib-rust muda.
 
-use crate::config;
+use crate::config::{self, CloudKind, CloudProvider, LocalProvider};
 use lib_rust::agents::{RemoteEvent, RemoteModelOutput};
 use lib_rust::ToolCall;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKind {
-    Local,
-    OpenAi,
-}
+/// Closure de um round remoto usado por `AgentManager::run_remote_turn`.
+pub type CloudGenerator =
+    Box<dyn Fn(Vec<Value>, &mut dyn FnMut(RemoteEvent)) -> Result<RemoteModelOutput, String>>;
 
-impl ProviderKind {
-    pub fn label(&self) -> &'static str {
-        match self {
-            ProviderKind::Local => "local",
-            ProviderKind::OpenAi => "openai",
-        }
-    }
-    pub fn from_str(s: &str) -> Self {
-        if s == config::DEFAULT_PROVIDER_OPENAI {
-            ProviderKind::OpenAi
-        } else {
-            ProviderKind::Local
-        }
-    }
-}
-
-/// Configuracao efetiva do provider no momento.
+/// Provider ativo no momento.
 #[derive(Debug, Clone)]
-pub struct ProviderSettings {
-    pub kind: ProviderKind,
-    pub base_url: String,
-    pub model: String,
-    /// Resolvido: env `OPENAI_API_KEY` quando presentes; senao o valor do
-    /// config.json. None = sem chave configurada.
-    pub api_key: Option<String>,
+pub enum Selected {
+    Local(LocalProvider),
+    Cloud(CloudProvider),
 }
 
-impl ProviderSettings {
+impl Selected {
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, Selected::Cloud(_))
+    }
+
+    pub fn model(&self) -> &str {
+        match self {
+            Selected::Local(p) => &p.model,
+            Selected::Cloud(p) => &p.model,
+        }
+    }
+
+    pub fn ctx(&self) -> usize {
+        match self {
+            Selected::Local(p) => p.ctx,
+            Selected::Cloud(p) => p.ctx,
+        }
+    }
+
     pub fn summary(&self) -> String {
-        match self.kind {
-            ProviderKind::Local => format!("local ({})", self.model),
-            ProviderKind::OpenAi => {
-                let key = if self.api_key.is_some() { "key ok" } else { "SEM API KEY" };
-                format!("openai: {} [{}] @ {}", self.model, key, self.base_url)
+        match self {
+            Selected::Local(p) => format!("local: {} ({})", p.name, p.model),
+            Selected::Cloud(p) => {
+                let key = if resolve_cloud_key(p).is_some() {
+                    "key ok"
+                } else {
+                    "SEM API KEY"
+                };
+                let mut s = format!(
+                    "{}: {} [{}] @ {} ({})",
+                    p.kind.label(),
+                    p.model,
+                    key,
+                    p.base_url,
+                    p.name
+                );
+                if !p.reasoning_effort.trim().is_empty() {
+                    s.push_str(&format!(" | raciocinio {}", p.reasoning_effort));
+                }
+                s
             }
         }
     }
 }
 
-/// Estado compartilhado do provider entre a TUI (escolhe) e o worker (turnos).
-/// Persiste a escolha em `~/.drill/config.json`.
+/// Item do overlay `/provider`.
+#[derive(Debug, Clone)]
+pub struct ProviderEntry {
+    pub id: String,
+    pub name: String,
+    pub detail: String,
+    pub cloud: bool,
+}
+
+struct State {
+    local: Vec<LocalProvider>,
+    cloud: Vec<CloudProvider>,
+    selected: Option<String>,
+}
+
+/// Estado compartilhado dos providers entre a TUI (escolhe) e o worker
+/// (turnos). Persiste a escolha em `~/.drill/config.json`.
 pub struct ProviderStore {
-    pub settings: Arc<Mutex<ProviderSettings>>,
+    state: Arc<Mutex<State>>,
     pub config_path: PathBuf,
 }
 
 impl ProviderStore {
     pub fn new(cfg: &config::DrillConfig, config_path: PathBuf) -> Self {
-        let kind = ProviderKind::from_str(&cfg.provider);
-        let base_url = if cfg.openai_base_url.trim().is_empty() {
-            config::DEFAULT_OPENAI_BASE_URL.to_string()
-        } else {
-            cfg.openai_base_url.clone()
-        };
-        let settings = ProviderSettings {
-            kind,
-            base_url,
-            model: cfg.openai_model.clone(),
-            api_key: resolve_api_key(&cfg.openai_api_key),
-        };
         Self {
-            settings: Arc::new(Mutex::new(settings)),
+            state: Arc::new(Mutex::new(State {
+                local: cfg.providers.local.clone(),
+                cloud: cfg.providers.cloud.clone(),
+                selected: cfg.provider_selected_uuid.clone(),
+            })),
             config_path,
         }
     }
 
-    pub fn set_api_key(&self, key: Option<String>) {
-        // atualiza settings + grava em config.json (openai_api_key)
-    }
-
-    pub fn current(&self) -> ProviderSettings {
-        self.settings.lock().unwrap().clone()
-    }
-
-    pub fn kind(&self) -> ProviderKind {
-        self.current().kind
-    }
-
-    /// Troca o provider. Persiste em config.json. `openai_model` vazio e
-    /// preenchido pelo chamador (worker) via `first_available_model` quando o
-    /// usuario escolhe a API sem modelo definido.
-    pub fn set_kind(&self, kind: ProviderKind) {
-        let mut guard = self.settings.lock().unwrap();
-        guard.kind = kind;
-        drop(guard);
-        let path = self.config_path.clone();
-        let _ = config::update(&path, |cfg| {
-            cfg.provider = kind.label().to_string();
-        });
-    }
-
-    /// Define/limpa o modelo da API remota, persistindo.
-    pub fn set_openai(&self, base_url: Option<String>, model: String) {
-        let url_for_cfg = base_url.clone();
-        let mut guard = self.settings.lock().unwrap();
-        if let Some(url) = base_url {
-            guard.base_url = url;
+    fn resolve<'a>(state: &'a State, uuid: &Option<String>) -> Option<Selected> {
+        let uuid = uuid.as_deref()?;
+        if let Some(p) = state.local.iter().find(|p| p.id == uuid) {
+            return Some(Selected::Local(p.clone()));
         }
-        guard.model = model.clone();
-        drop(guard);
-        let path = self.config_path.clone();
-        let _ = config::update(&path, |cfg| {
-            cfg.provider = ProviderKind::OpenAi.label().to_string();
-            if let Some(url) = url_for_cfg {
-                cfg.openai_base_url = url;
-            }
-            cfg.openai_model = model;
-        });
+        state
+            .cloud
+            .iter()
+            .find(|p| p.id == uuid)
+            .map(|p| Selected::Cloud(p.clone()))
     }
 
-    /// Chave configurada? (env vence o config.json.)
-    pub fn has_api_key(&self) -> bool {
-        let guard = self.settings.lock().unwrap();
-        guard.api_key.is_some()
+    /// Provider ativo. Cai no primeiro local/cloud se o uuid persistido nao
+    /// existir mais (o `ensure_defaults` costuma evitar isso).
+    pub fn current(&self) -> Selected {
+        let guard = self.state.lock().unwrap();
+        Self::resolve(&guard, &guard.selected)
+            .or_else(|| guard.local.first().cloned().map(Selected::Local))
+            .or_else(|| guard.cloud.first().cloned().map(Selected::Cloud))
+            .unwrap_or_else(|| Selected::Local(LocalProvider::default()))
     }
-}
 
-/// Resolve a chave: env `OPENAI_API_KEY` primeiro, depois o campo do config.
-pub fn resolve_api_key(config_key: &str) -> Option<String> {
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        let trimmed = key.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
+    pub fn selected_cloud(&self) -> Option<CloudProvider> {
+        match self.current() {
+            Selected::Cloud(p) => Some(p),
+            _ => None,
         }
     }
-    let trimmed = config_key.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
 
-pub fn base_url_with_env(configured: &str) -> String {
-    std::env::var("OPENAI_BASE_URL")
-        .map(|v| {
-            let t = v.trim().trim_end_matches('/');
-            if t.is_empty() {
-                configured.to_string()
+    pub fn selected_local(&self) -> Option<LocalProvider> {
+        match self.current() {
+            Selected::Local(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn is_cloud(&self) -> bool {
+        self.current().is_cloud()
+    }
+
+    pub fn summary(&self) -> String {
+        self.current().summary()
+    }
+
+    /// Snapshot para a TUI: entradas (local + cloud) e o uuid selecionado.
+    pub fn snapshot(&self) -> (Vec<ProviderEntry>, Option<String>) {
+        let guard = self.state.lock().unwrap();
+        let selected = guard.selected.clone();
+        let mut entries = Vec::new();
+        for p in &guard.local {
+            entries.push(ProviderEntry {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                detail: format!("local · {} (ngl {}, ctx {})", p.model, p.ngl, p.ctx),
+                cloud: false,
+            });
+        }
+        for p in &guard.cloud {
+            let key = if resolve_cloud_key(p).is_some() {
+                "key ok"
             } else {
-                t.to_string()
+                "sem key"
+            };
+            let router = if p.router.trim().is_empty() {
+                default_router(p.kind, "")
+            } else {
+                p.router.trim().to_string()
+            };
+            entries.push(ProviderEntry {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                detail: format!(
+                    "{} · {} · {} [{}, {}]",
+                    p.kind.label(),
+                    p.model,
+                    router,
+                    key,
+                    p.base_url
+                ),
+                cloud: true,
+            });
+        }
+        (entries, selected)
+    }
+
+    /// Troca o provider ativo pelo uuid. Persiste em config.json.
+    pub fn select(&self, uuid: &str) -> Result<String, String> {
+        let mut guard = self.state.lock().unwrap();
+        if Self::resolve(&guard, &Some(uuid.to_string())).is_none() {
+            return Err(format!("provider '{}' nao existe no config", uuid));
+        }
+        guard.selected = Some(uuid.to_string());
+        let selected = uuid.to_string();
+        drop(guard);
+
+        let path = self.config_path.clone();
+        config::update(&path, |cfg| {
+            cfg.provider_selected_uuid = Some(selected);
+        })?;
+        Ok(self.summary())
+    }
+
+    /// Define modelo + forca do raciocinio do provider cloud ativo, persistindo.
+    pub fn set_model_and_effort(
+        &self,
+        model: String,
+        reasoning_effort: String,
+    ) -> Result<(), String> {
+        let uuid = {
+            let mut guard = self.state.lock().unwrap();
+            let Some(uuid) = guard.selected.clone() else {
+                return Err("nenhum provider selecionado".to_string());
+            };
+            let Some(cloud) = guard.cloud.iter_mut().find(|p| p.id == uuid) else {
+                return Err("provider ativo nao e remoto (modelo so vale para cloud)".to_string());
+            };
+            cloud.model = model.clone();
+            cloud.reasoning_effort = reasoning_effort.clone();
+            uuid
+        };
+        let path = self.config_path.clone();
+        config::update(&path, move |cfg| {
+            if let Some(cloud) = cfg.providers.cloud.iter_mut().find(|p| p.id == uuid) {
+                cloud.model = model;
+                cloud.reasoning_effort = reasoning_effort;
             }
         })
-        .unwrap_or_else(|_| configured.trim_end_matches('/').to_string())
+    }
+
+    /// Atualiza o modelo e o mmproj do provider local ativo (ou o primeiro
+    /// local configurado), gravando em config.json.
+    pub fn set_local_model(
+        &self,
+        model: String,
+        mmproj: String,
+    ) -> Result<(), String> {
+        let uuid = {
+            let mut guard = self.state.lock().unwrap();
+            let selected = guard.selected.clone();
+            let idx = guard
+                .local
+                .iter()
+                .position(|p| Some(&p.id) == selected.as_ref())
+                .unwrap_or(0);
+            let target = guard
+                .local
+                .get_mut(idx)
+                .ok_or_else(|| "nenhum provider local configurado (/provider)".to_string())?;
+            target.model = model.clone();
+            target.mmproj = mmproj.clone();
+            let uuid = target.id.clone();
+            uuid
+        };
+        let path = self.config_path.clone();
+        config::update(&path, move |cfg| {
+            if let Some(local) = cfg.providers.local.iter_mut().find(|p| p.id == uuid) {
+                local.model = model;
+                local.mmproj = mmproj;
+            } else {
+                cfg.model = model;
+            }
+        })
+    }
+
+    /// Adiciona um provider cloud novo (wizard `a` do overlay /provider), grava
+    /// em config.json e o deixa como provider ativo.
+    pub fn add_cloud(
+        &self,
+        kind: CloudKind,
+        base_url: String,
+        model: String,
+        api_key: String,
+    ) -> Result<String, String> {
+        let (provider, uuid) = {
+            let mut guard = self.state.lock().unwrap();
+            let n = guard.cloud.len() + 1;
+            let provider = CloudProvider {
+                id: config::new_id("cloud"),
+                name: format!("{} {}", kind.label(), n),
+                kind,
+                base_url: base_url.trim().to_string(),
+                model: model.trim().to_string(),
+                router: String::new(),
+                api_key: api_key.trim().to_string(),
+                reasoning_effort: "medium".to_string(),
+                ctx: 8192,
+            };
+            let uuid = provider.id.clone();
+            guard.cloud.push(provider.clone());
+            guard.selected = Some(uuid.clone());
+            (provider, uuid)
+        };
+
+        let path = self.config_path.clone();
+        let provider_for_cfg = provider.clone();
+        config::update(&path, move |cfg| {
+            cfg.providers.cloud.push(provider_for_cfg);
+            cfg.provider_selected_uuid = Some(uuid);
+        })?;
+        Ok(self.summary())
+    }
+}
+
+/// Resolve a chave do provider cloud: campo do config primeiro, depois a env
+/// do vendor.
+pub fn resolve_cloud_key(cloud: &CloudProvider) -> Option<String> {
+    let trimmed = cloud.api_key.trim();
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    let var = match cloud.kind {
+        CloudKind::OpenAi => "OPENAI_API_KEY",
+        CloudKind::Anthropic => "ANTHROPIC_API_KEY",
+        CloudKind::Google => "GOOGLE_API_KEY",
+    };
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Prefere um id de modelo com vocacao de chat: ignora ASR/TTS/guard/audio.
@@ -187,123 +351,457 @@ pub fn pick_chat_model(models: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// LISTA os modelos disponiveis: `GET {base}/models`. Retorna os `id`s.
-pub fn list_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>, String> {
-    let url = format!("{}/models", base_url_with_env(base_url));
-    let client = http_client()?;
-    let mut req = client.get(&url);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
+fn default_router(kind: CloudKind, router: &str) -> String {
+    if !router.trim().is_empty() {
+        return router.trim().to_string();
     }
-    let resp = req
-        .send()
-        .map_err(|err| format!("falha ao listar modelos em {}: {}", url, err))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "GET {} -> HTTP {}",
-            url,
-            resp.status().as_u16()
-        ));
+    match kind {
+        CloudKind::OpenAi => "/chat/completions".to_string(),
+        CloudKind::Anthropic => "/v1/messages".to_string(),
+        CloudKind::Google => "streamGenerateContent".to_string(),
     }
-    let body: Value = resp
-        .json()
-        .map_err(|err| format!("resposta invalida de {}: {}", url, err))?;
-    let ids = body
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(Value::as_str))
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if ids.is_empty() {
-        return Err(format!("nenhum modelo listado por {}", url));
-    }
-    Ok(ids)
 }
 
-/// Monta o closure de UM round remoto usado por `AgentManager::run_remote_turn`.
-///
-/// Faz um POST streaming em `{base}/chat/completions`, emite `Content`/
-/// `Reasoning`/`ToolCall` ao vivo e devolve a saida estruturada. Respeita o
-/// `interrupt` compartilhado (Esc/steer) entre chunks.
-#[allow(clippy::too_many_arguments)]
-pub fn openai_generator(
-    base_url: String,
-    api_key: Option<String>,
-    model: String,
+/// Junta base_url + router sem duplicar barras. `router` vazio usa o default.
+fn endpoint(base_url: &str, router: &str, default: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    let path = if router.trim().is_empty() {
+        default
+    } else {
+        router.trim()
+    };
+    if path.starts_with('/') {
+        format!("{}{}", base, path)
+    } else {
+        format!("{}/{}", base, path)
+    }
+}
+
+fn has_tools(tools: &Value) -> bool {
+    !tools.is_null() && !matches!(tools, Value::Array(v) if v.is_empty())
+}
+
+/// LISTA os modelos disponiveis no provider cloud ativo.
+pub fn list_models(cloud: &CloudProvider) -> Result<Vec<String>, String> {
+    let key = resolve_cloud_key(cloud);
+    let client = http_client()?;
+    match cloud.kind {
+        CloudKind::OpenAi => {
+            let url = endpoint(&cloud.base_url, "/models", "/models");
+            let mut req = client.get(&url);
+            if let Some(key) = &key {
+                req = req.bearer_auth(key);
+            }
+            let body: Value = get_json(req, &url)?;
+            let ids = body
+                .get("data")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("id").and_then(Value::as_str))
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Err(format!("nenhum modelo listado por {}", url));
+            }
+            Ok(ids)
+        }
+        CloudKind::Google => {
+            let url = endpoint(&cloud.base_url, "/models", "/models");
+            let mut req = client.get(&url);
+            if let Some(key) = &key {
+                req = req.header("x-goog-api-key", key);
+            }
+            let body: Value = get_json(req, &url)?;
+            let ids = body
+                .get("models")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.get("name").and_then(Value::as_str))
+                        .map(|s| s.strip_prefix("models/").unwrap_or(s).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                return Err(format!("nenhum modelo listado por {}", url));
+            }
+            Ok(ids)
+        }
+        CloudKind::Anthropic => Err(
+            "listagem de modelos nao suportada pela API anthropic; informe o modelo no config"
+                .to_string(),
+        ),
+    }
+}
+
+fn get_json(req: reqwest::blocking::RequestBuilder, url: &str) -> Result<Value, String> {
+    let resp = req
+        .send()
+        .map_err(|err| format!("falha ao chamar {}: {}", url, err))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().unwrap_or_default();
+        return Err(format!("GET {} -> HTTP {}: {}", url, status, text));
+    }
+    resp.json()
+        .map_err(|err| format!("resposta invalida de {}: {}", url, err))
+}
+
+/// Monta o generator de um round remoto conforme o tipo do provider.
+pub fn build_generator(
+    cloud: &CloudProvider,
+    tools: Value,
+    temperature: f32,
+    max_tokens: usize,
+    interrupt: Arc<AtomicBool>,
+) -> CloudGenerator {
+    match cloud.kind {
+        CloudKind::OpenAi => {
+            if cloud.router.to_lowercase().contains("responses") {
+                Box::new(openai_responses_generator(
+                    cloud.clone(),
+                    tools,
+                    temperature,
+                    max_tokens,
+                    interrupt,
+                ))
+            } else {
+                Box::new(openai_chat_generator(
+                    cloud.clone(),
+                    tools,
+                    temperature,
+                    max_tokens,
+                    interrupt,
+                ))
+            }
+        }
+        CloudKind::Anthropic => Box::new(anthropic_generator(
+            cloud.clone(),
+            tools,
+            temperature,
+            max_tokens,
+            interrupt,
+        )),
+        CloudKind::Google => Box::new(google_generator(
+            cloud.clone(),
+            tools,
+            temperature,
+            max_tokens,
+            interrupt,
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers de traducao do IR (shape OpenAI) para o wire de cada vendor.
+// ---------------------------------------------------------------------------
+
+fn text_of(message: &Value) -> String {
+    message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Payloads SSE (`data: ...`), ignorando `[DONE]`, eventos e vazios.
+fn sse_payloads(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        if rest.is_empty() || rest == "[DONE]" {
+            continue;
+        }
+        out.push(rest.to_string());
+    }
+    out
+}
+
+fn args_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+fn openai_chat_tools(tools: &Value) -> Value {
+    tools.clone()
+}
+
+fn responses_tools(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        arr.iter()
+            .filter_map(|t| {
+                let fun = t.get("function")?;
+                Some(json!({
+                    "type": "function",
+                    "name": fun.get("name").cloned().unwrap_or(json!("")),
+                    "description": fun.get("description").cloned().unwrap_or(json!("")),
+                    "parameters": fun.get("parameters").cloned().unwrap_or(json!({})),
+                }))
+            })
+            .collect(),
+    )
+}
+
+fn anthropic_tools(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        arr.iter()
+            .filter_map(|t| {
+                let fun = t.get("function")?;
+                Some(json!({
+                    "name": fun.get("name").cloned().unwrap_or(json!("")),
+                    "description": fun.get("description").cloned().unwrap_or(json!("")),
+                    "input_schema": fun.get("parameters").cloned().unwrap_or(json!({"type":"object"})),
+                }))
+            })
+            .collect(),
+    )
+}
+
+fn google_tools(tools: &Value) -> Value {
+    let Some(arr) = tools.as_array() else {
+        return Value::Array(Vec::new());
+    };
+    let decls: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let fun = t.get("function")?;
+            Some(json!({
+                "name": fun.get("name").cloned().unwrap_or(json!("")),
+                "description": fun.get("description").cloned().unwrap_or(json!("")),
+                "parameters": fun.get("parameters").cloned().unwrap_or(json!({"type":"object"})),
+            }))
+        })
+        .collect();
+    if decls.is_empty() {
+        Value::Array(Vec::new())
+    } else {
+        json!([{ "functionDeclarations": decls }])
+    }
+}
+
+/// IR -> `(instructions, input)` da OpenAI Responses API.
+fn responses_input(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "system" => instructions.push(text_of(m)),
+            "assistant" => {
+                let content = text_of(m);
+                if !content.is_empty() {
+                    input.push(json!({"role": "assistant", "content": content}));
+                }
+                if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                    for tc in calls {
+                        let fun = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": tc.get("id").cloned().unwrap_or(json!("")),
+                            "name": fun.get("name").cloned().unwrap_or(json!("")),
+                            "arguments": fun.get("arguments").cloned().unwrap_or(json!("{}")),
+                        }));
+                    }
+                }
+            }
+            "tool" => input.push(json!({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id").cloned().unwrap_or(json!("")),
+                "output": text_of(m),
+            })),
+            _ => input.push(json!({"role": role, "content": text_of(m)})),
+        }
+    }
+    let instr = if instructions.is_empty() {
+        None
+    } else {
+        Some(instructions.join("\n\n"))
+    };
+    (instr, input)
+}
+
+/// IR -> `(system, messages)` da Anthropic Messages API.
+fn anthropic_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut out = Vec::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "system" => system.push(text_of(m)),
+            "assistant" => {
+                let mut blocks = Vec::new();
+                let content = text_of(m);
+                if !content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": content}));
+                }
+                if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                    for tc in calls {
+                        let fun = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                        let raw = fun
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc.get("id").cloned().unwrap_or(json!("")),
+                            "name": fun.get("name").cloned().unwrap_or(json!("")),
+                            "input": args_value(raw),
+                        }));
+                    }
+                }
+                if !blocks.is_empty() {
+                    out.push(json!({"role": "assistant", "content": blocks}));
+                }
+            }
+            "tool" => out.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id").cloned().unwrap_or(json!("")),
+                    "content": text_of(m),
+                }],
+            })),
+            _ => out.push(json!({
+                "role": "user",
+                "content": [{"type": "text", "text": text_of(m)}],
+            })),
+        }
+    }
+    let sys = if system.is_empty() {
+        None
+    } else {
+        Some(system.join("\n\n"))
+    };
+    (sys, out)
+}
+
+/// IR -> `(systemInstruction, contents)` do Google Generative Language API.
+fn google_contents(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
+    let mut system = Vec::new();
+    let mut out = Vec::new();
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "system" => system.push(text_of(m)),
+            "assistant" => {
+                let mut parts = Vec::new();
+                let content = text_of(m);
+                if !content.is_empty() {
+                    parts.push(json!({"text": content}));
+                }
+                if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                    for tc in calls {
+                        let fun = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                        let name = fun
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let raw = fun
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            names.insert(id.to_string(), name.clone());
+                        }
+                        parts.push(json!({
+                            "functionCall": {"name": name, "args": args_value(raw)},
+                        }));
+                    }
+                }
+                if !parts.is_empty() {
+                    out.push(json!({"role": "model", "parts": parts}));
+                }
+            }
+            "tool" => {
+                let id = m
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = names.get(&id).cloned().unwrap_or_default();
+                out.push(json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": name,
+                            "response": {"result": text_of(m)},
+                        },
+                    }],
+                }));
+            }
+            _ => out.push(json!({
+                "role": "user",
+                "parts": [{"text": text_of(m)}],
+            })),
+        }
+    }
+    let sys = if system.is_empty() {
+        None
+    } else {
+        Some(json!({"parts": [{"text": system.join("\n\n")}]}))
+    };
+    (sys, out)
+}
+
+// ---------------------------------------------------------------------------
+// Generators por vendor.
+// ---------------------------------------------------------------------------
+
+/// OpenAI `/chat/completions` (e qualquer endpoint OpenAI-compativel).
+pub fn openai_chat_generator(
+    cloud: CloudProvider,
     tools: Value,
     temperature: f32,
     max_tokens: usize,
     interrupt: Arc<AtomicBool>,
 ) -> impl Fn(Vec<Value>, &mut dyn FnMut(RemoteEvent)) -> Result<RemoteModelOutput, String> {
     move |messages: Vec<Value>, emit: &mut dyn FnMut(RemoteEvent)| {
-        let url = format!("{}/chat/completions", base_url_with_env(&base_url));
+        let url = endpoint(&cloud.base_url, &cloud.router, "/chat/completions");
         let mut body = json!({
-            "model": model,
+            "model": cloud.model,
             "messages": messages,
             "stream": true,
             "temperature": temperature,
             "max_tokens": max_tokens,
         });
-        if !tools.is_null() && !matches!(&tools, Value::Array(v) if v.is_empty()) {
-            body["tools"] = tools.clone();
+        let effort = cloud.reasoning_effort.trim();
+        if !effort.is_empty() {
+            body["reasoning_effort"] = Value::String(effort.to_string());
+        }
+        if has_tools(&tools) {
+            body["tools"] = openai_chat_tools(&tools);
             body["tool_choice"] = Value::String("auto".to_string());
         }
 
         let client = http_client()?;
         let mut req = client.post(&url).json(&body);
-        if let Some(key) = &api_key {
+        if let Some(key) = resolve_cloud_key(&cloud) {
             req = req.bearer_auth(key);
         }
         let started = Instant::now();
-        let mut resp = req
-            .send()
-            .map_err(|err| format!("falha ao chamar {}: {}", url, err))
-            .and_then(|resp| {
-                if resp.status().is_success() {
-                    Ok(resp)
-                } else {
-                    let status = resp.status().as_u16();
-                    let text = resp.text().unwrap_or_default();
-                    Err(format!("POST {} -> HTTP {}: {}", url, status, text))
-                }
-            })?;
+        let body_text = post_stream(req, &url)?;
 
         let mut content = String::new();
         let mut reasoning = String::new();
-        // Names/args dos tool calls acumulados por indice do delta do stream.
-        let mut tools_by_idx: std::collections::BTreeMap<usize, (String, String, String)> =
-            std::collections::BTreeMap::new();
+        let mut tools_by_idx: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         let mut usage: Option<(i64, i64, i64)> = None;
 
-        let mut buffer = Vec::new();
-        let mut done = false;
-        let mut body_text = String::new();
-        resp.read_to_string(&mut body_text)
-            .map_err(|err| format!("erro ao ler stream de {}: {}", url, err))?;
-        buffer.extend_from_slice(body_text.as_bytes());
-
-        for line in buffer.split(|&b| b == b'\n') {
-            if done {
-                break;
-            }
-            let line = String::from_utf8_lossy(line);
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let payload = line
-                .strip_prefix("data:")
-                .map(str::trim)
-                .unwrap_or(line);
-            if payload == "[DONE]" {
-                done = true;
-                break;
-            }
-            let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
+        for payload in sse_payloads(&body_text) {
+            let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
                 continue;
             };
             if let Some(u) = chunk.get("usage") {
@@ -336,7 +834,9 @@ pub fn openai_generator(
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tc in calls {
                     let index = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let entry = tools_by_idx.entry(index).or_insert_with(|| (String::new(), String::new(), String::new()));
+                    let entry = tools_by_idx
+                        .entry(index)
+                        .or_insert_with(|| (String::new(), String::new(), String::new()));
                     if let Some(id) = tc.get("id").and_then(Value::as_str) {
                         entry.0 = id.to_string();
                     }
@@ -352,43 +852,455 @@ pub fn openai_generator(
             }
         }
 
+        let calls = collect_calls(tools_by_idx, emit);
+        let output = finalize(content, reasoning, calls, usage, started);
+        let _ = interrupt.load(Ordering::Relaxed);
+        Ok(output)
+    }
+}
+
+/// OpenAI `/responses`.
+pub fn openai_responses_generator(
+    cloud: CloudProvider,
+    tools: Value,
+    temperature: f32,
+    max_tokens: usize,
+    interrupt: Arc<AtomicBool>,
+) -> impl Fn(Vec<Value>, &mut dyn FnMut(RemoteEvent)) -> Result<RemoteModelOutput, String> {
+    move |messages: Vec<Value>, emit: &mut dyn FnMut(RemoteEvent)| {
+        let url = endpoint(&cloud.base_url, &cloud.router, "/responses");
+        let (instructions, input) = responses_input(&messages);
+        let mut body = json!({
+            "model": cloud.model,
+            "input": input,
+            "stream": true,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        });
+        if let Some(instr) = instructions {
+            body["instructions"] = Value::String(instr);
+        }
+        let effort = cloud.reasoning_effort.trim();
+        if !effort.is_empty() {
+            body["reasoning"] = json!({"effort": effort});
+        }
+        if has_tools(&tools) {
+            body["tools"] = responses_tools(&tools);
+            body["tool_choice"] = Value::String("auto".to_string());
+        }
+
+        let client = http_client()?;
+        let mut req = client.post(&url).json(&body);
+        if let Some(key) = resolve_cloud_key(&cloud) {
+            req = req.bearer_auth(key);
+        }
+        let started = Instant::now();
+        let body_text = post_stream(req, &url)?;
+
+        let mut content = String::new();
+        let mut reasoning = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
-        for (idx, (call_id, name, args_raw)) in tools_by_idx {
+        let mut usage: Option<(i64, i64, i64)> = None;
+
+        for payload in sse_payloads(&body_text) {
+            let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            match chunk.get("type").and_then(Value::as_str).unwrap_or("") {
+                "response.output_text.delta" => {
+                    if let Some(d) = chunk.get("delta").and_then(Value::as_str) {
+                        if !d.is_empty() {
+                            content.push_str(d);
+                            emit(RemoteEvent::Content(d.to_string()));
+                        }
+                    }
+                }
+                "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                    if let Some(d) = chunk.get("delta").and_then(Value::as_str) {
+                        if !d.is_empty() {
+                            reasoning.push_str(d);
+                            emit(RemoteEvent::Reasoning(d.to_string()));
+                        }
+                    }
+                }
+                "response.output_item.done" => {
+                    let item = chunk.get("item").cloned().unwrap_or_else(|| json!({}));
+                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let raw = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if !name.is_empty() {
+                            let tool = ToolCall {
+                                call_id: if call_id.is_empty() {
+                                    format!("call_{}", calls.len())
+                                } else {
+                                    call_id
+                                },
+                                command: name.clone(),
+                                name,
+                                args: args_value(raw),
+                            };
+                            emit(RemoteEvent::ToolCall(tool.clone()));
+                            calls.push(tool);
+                        }
+                    }
+                }
+                "response.completed" => {
+                    if let Some(u) = chunk.get("response").and_then(|r| r.get("usage")) {
+                        usage = Some((
+                            u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
+                            u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
+                            u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let output = finalize(content, reasoning, calls, usage, started);
+        let _ = interrupt.load(Ordering::Relaxed);
+        Ok(output)
+    }
+}
+
+/// Anthropic Messages API.
+pub fn anthropic_generator(
+    cloud: CloudProvider,
+    tools: Value,
+    temperature: f32,
+    max_tokens: usize,
+    interrupt: Arc<AtomicBool>,
+) -> impl Fn(Vec<Value>, &mut dyn FnMut(RemoteEvent)) -> Result<RemoteModelOutput, String> {
+    move |messages: Vec<Value>, emit: &mut dyn FnMut(RemoteEvent)| {
+        let url = endpoint(&cloud.base_url, &cloud.router, "/v1/messages");
+        let (system, msgs) = anthropic_messages(&messages);
+        let mut body = json!({
+            "model": cloud.model,
+            "messages": msgs,
+            "max_tokens": max_tokens,
+            "stream": true,
+            "temperature": temperature,
+        });
+        if let Some(sys) = system {
+            body["system"] = Value::String(sys);
+        }
+        if has_tools(&tools) {
+            let t = anthropic_tools(&tools);
+            if has_tools(&t) {
+                body["tools"] = t;
+            }
+        }
+
+        let client = http_client()?;
+        let mut req = client
+            .post(&url)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body);
+        if let Some(key) = resolve_cloud_key(&cloud) {
+            req = req.header("x-api-key", key);
+        }
+        let started = Instant::now();
+        let body_text = post_stream(req, &url)?;
+
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        // index do bloco -> (id, name, json parcial)
+        let mut blocks: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
+        let mut usage: Option<(i64, i64, i64)> = None;
+
+        for payload in sse_payloads(&body_text) {
+            let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            match chunk.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message_start" => {
+                    if let Some(u) = chunk
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(Value::as_i64)
+                    {
+                        usage.get_or_insert((0, 0, 0)).0 = u;
+                    }
+                }
+                "content_block_start" => {
+                    let index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let block = chunk.get("content_block").cloned().unwrap_or_else(|| json!({}));
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        blocks.insert(index, (id, name, String::new()));
+                    }
+                }
+                "content_block_delta" => {
+                    let index = chunk.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let delta = chunk.get("delta").cloned().unwrap_or_else(|| json!({}));
+                    match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "text_delta" => {
+                            if let Some(t) = delta.get("text").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    content.push_str(t);
+                                    emit(RemoteEvent::Content(t.to_string()));
+                                }
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(t) = delta.get("thinking").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    reasoning.push_str(t);
+                                    emit(RemoteEvent::Reasoning(t.to_string()));
+                                }
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(p) = delta.get("partial_json").and_then(Value::as_str) {
+                                if let Some(entry) = blocks.get_mut(&index) {
+                                    entry.2.push_str(p);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "message_delta" => {
+                    if let Some(out) = chunk
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(Value::as_i64)
+                    {
+                        let e = usage.get_or_insert((0, 0, 0));
+                        e.1 = out;
+                        e.2 = e.0 + e.1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for (_, (id, name, raw)) in blocks {
             if name.is_empty() {
                 continue;
             }
-            let args: Value = match serde_json::from_str(&args_raw) {
-                Ok(value) => value,
-                Err(_) => Value::String(args_raw),
-            };
             let tool = ToolCall {
-                call_id: if call_id.is_empty() { format!("call_{}", idx) } else { call_id },
+                call_id: if id.is_empty() {
+                    format!("call_{}", calls.len())
+                } else {
+                    id
+                },
                 command: name.clone(),
                 name,
-                args,
+                args: args_value(&raw),
             };
             emit(RemoteEvent::ToolCall(tool.clone()));
             calls.push(tool);
         }
 
-        let (prompt_tokens, completion_tokens, total_tokens) = usage.unwrap_or((0, 0, 0));
-        let tps = if completion_tokens > 0 {
-            Some(completion_tokens as f64 / started.elapsed().as_secs_f64().max(0.001))
-        } else {
-            None
-        };
-        let output = RemoteModelOutput {
-            content,
-            calls,
-            tokens: (total_tokens > 0).then_some(total_tokens),
-            tps,
-            context_tokens: (prompt_tokens > 0).then_some(prompt_tokens),
-        };
-        if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(output); // interrupcao tratada pelo loop (round termina aqui)
-        }
+        let output = finalize(content, reasoning, calls, usage, started);
+        let _ = interrupt.load(Ordering::Relaxed);
         Ok(output)
     }
+}
+
+/// Google Generative Language API (`streamGenerateContent`).
+pub fn google_generator(
+    cloud: CloudProvider,
+    tools: Value,
+    temperature: f32,
+    max_tokens: usize,
+    interrupt: Arc<AtomicBool>,
+) -> impl Fn(Vec<Value>, &mut dyn FnMut(RemoteEvent)) -> Result<RemoteModelOutput, String> {
+    move |messages: Vec<Value>, emit: &mut dyn FnMut(RemoteEvent)| {
+        let router = if cloud.router.trim().is_empty() {
+            "streamGenerateContent".to_string()
+        } else {
+            cloud.router.trim().trim_start_matches('/').to_string()
+        };
+        let base = cloud.base_url.trim().trim_end_matches('/');
+        let url = format!("{}/models/{}:{}?alt=sse", base, cloud.model, router);
+        let (system, contents) = google_contents(&messages);
+        let mut body = json!({
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        });
+        if let Some(sys) = system {
+            body["systemInstruction"] = sys;
+        }
+        if has_tools(&tools) {
+            let t = google_tools(&tools);
+            if has_tools(&t) {
+                body["tools"] = t;
+            }
+        }
+
+        let client = http_client()?;
+        let mut req = client.post(&url).json(&body);
+        if let Some(key) = resolve_cloud_key(&cloud) {
+            req = req.header("x-goog-api-key", key);
+        }
+        let started = Instant::now();
+        let body_text = post_stream(req, &url)?;
+
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        let mut usage: Option<(i64, i64, i64)> = None;
+
+        for payload in sse_payloads(&body_text) {
+            let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
+                continue;
+            };
+            if let Some(u) = chunk.get("usageMetadata") {
+                usage = Some((
+                    u.get("promptTokenCount").and_then(Value::as_i64).unwrap_or(0),
+                    u.get("candidatesTokenCount").and_then(Value::as_i64).unwrap_or(0),
+                    u.get("totalTokenCount").and_then(Value::as_i64).unwrap_or(0),
+                ));
+            }
+            let Some(parts) = chunk
+                .get("candidates")
+                .and_then(Value::as_array)
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("content"))
+                .and_then(|c| c.get("parts"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        content.push_str(t);
+                        emit(RemoteEvent::Content(t.to_string()));
+                    }
+                }
+                if part.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        if !t.is_empty() {
+                            reasoning.push_str(t);
+                            emit(RemoteEvent::Reasoning(t.to_string()));
+                        }
+                    }
+                }
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.is_empty() {
+                        let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                        let tool = ToolCall {
+                            call_id: format!("call_{}", calls.len()),
+                            command: name.clone(),
+                            name,
+                            args,
+                        };
+                        emit(RemoteEvent::ToolCall(tool.clone()));
+                        calls.push(tool);
+                    }
+                }
+            }
+        }
+
+        let output = finalize(content, reasoning, calls, usage, started);
+        let _ = interrupt.load(Ordering::Relaxed);
+        Ok(output)
+    }
+}
+
+fn collect_calls(
+    tools_by_idx: BTreeMap<usize, (String, String, String)>,
+    emit: &mut dyn FnMut(RemoteEvent),
+) -> Vec<ToolCall> {
+    let mut calls: Vec<ToolCall> = Vec::new();
+    for (idx, (call_id, name, args_raw)) in tools_by_idx {
+        if name.is_empty() {
+            continue;
+        }
+        let tool = ToolCall {
+            call_id: if call_id.is_empty() {
+                format!("call_{}", idx)
+            } else {
+                call_id
+            },
+            command: name.clone(),
+            name,
+            args: args_value(&args_raw),
+        };
+        emit(RemoteEvent::ToolCall(tool.clone()));
+        calls.push(tool);
+    }
+    calls
+}
+
+fn finalize(
+    content: String,
+    reasoning: String,
+    calls: Vec<ToolCall>,
+    usage: Option<(i64, i64, i64)>,
+    started: Instant,
+) -> RemoteModelOutput {
+    let _ = reasoning;
+    let (prompt_tokens, completion_tokens, total_tokens) = usage.unwrap_or((0, 0, 0));
+    let tps = if completion_tokens > 0 {
+        Some(completion_tokens as f64 / started.elapsed().as_secs_f64().max(0.001))
+    } else {
+        None
+    };
+    RemoteModelOutput {
+        content,
+        calls,
+        tokens: (total_tokens > 0).then_some(total_tokens),
+        tps,
+        context_tokens: (prompt_tokens > 0).then_some(prompt_tokens),
+    }
+}
+
+fn post_stream(
+    req: reqwest::blocking::RequestBuilder,
+    url: &str,
+) -> Result<String, String> {
+    let mut resp = req
+        .send()
+        .map_err(|err| format!("falha ao chamar {}: {}", url, err))
+        .and_then(|resp| {
+            if resp.status().is_success() {
+                Ok(resp)
+            } else {
+                let status = resp.status().as_u16();
+                let text = resp.text().unwrap_or_default();
+                Err(format!("POST {} -> HTTP {}: {}", url, status, text))
+            }
+        })?;
+    let mut body_text = String::new();
+    resp.read_to_string(&mut body_text)
+        .map_err(|err| format!("erro ao ler stream de {}: {}", url, err))?;
+    Ok(body_text)
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {

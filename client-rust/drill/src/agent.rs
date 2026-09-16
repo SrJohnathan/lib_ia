@@ -1,5 +1,5 @@
 use crate::history::History;
-use crate::provider::{self, ProviderKind, ProviderStore};
+use crate::provider::{self, ProviderStore, Selected};
 use lib_rust::agents::{AgentMode, AgentOrchestrator, EventSink, TurnResult, MAESTRO_AGENT_ID};
 use lib_rust::RuntimeLlama;
 use serde_json::Value;
@@ -13,10 +13,22 @@ pub enum WorkerMsg {
     Turn(String),
     SetMode(Mode),
     SetSession(String),
-    /// Escolhe o provider do Root (solo/maestro). Subagentes ignoram.
-    SetProvider(ProviderKind),
-    /// Lista modelos da API OpenAI-compativel (so com provider remoto).
+    /// Troca o provider do Root pelo uuid (local ou cloud). Subagentes ignoram.
+    SetProvider(String),
+    /// Lista modelos do provider cloud ativo.
     ListModels,
+    /// Define modelo + forca do raciocinio do provider cloud ativo (persiste).
+    SetModelAndEffort(String, String),
+    /// Configura o modelo local: constroi o engine e instala o runtime (persiste).
+    SetLocalModel { model: String, mmproj: String },
+    /// Adiciona um provider cloud novo (wizard `a` no overlay /provider):
+    /// cria, persiste em config.json e o deixa ativo.
+    AddCloudProvider {
+        kind: crate::config::CloudKind,
+        base_url: String,
+        model: String,
+        api_key: String,
+    },
 }
 
 /// Cancela a geração nativa em andamento, de qualquer thread.
@@ -27,11 +39,11 @@ pub fn cancel_generation() {
 /// Frente do drill para a fila de agentes. Solo e agentes compartilham o
 /// MESMO caminho de geracao (`AgentOrchestrator` em `lib-rust`).
 /// O provider escolhido (`/provider`) so redireciona o turno do ROOT: com
-/// provider remoto, o turno nao enfileira no engine local e sim na API;
-/// subagentes (ask_agent) continuam SEMPRE no runtime local.
+/// provider cloud, o turno vai para a API; subagentes (ask_agent) continuam
+/// SEMPRE no runtime local.
 pub struct Agent {
     orchestrator: AgentOrchestrator,
-    provider: Arc<ProviderStore>,
+    pub provider: Arc<ProviderStore>,
 }
 
 impl Agent {
@@ -96,24 +108,19 @@ impl Agent {
         self.orchestrator.context_estimate()
     }
 
-    /// Turno unico para solo e agentes: enfileira no root ou resolve na API
-    /// remota, conforme o provider escolhido na TUI (`/provider`). Stats ja
-    /// lidas na thread da geracao.
+    /// Turno unico para solo e agentes: enfileira no root (local) ou resolve na
+    /// API remota, conforme o provider ativo (`/provider`).
     pub fn run_turn(&mut self, user_input: &str) -> Result<TurnResult, String> {
-        let provider = self.provider.kind();
-        match provider {
-            ProviderKind::Local => self.orchestrator.run_turn(user_input),
-            ProviderKind::OpenAi => {
-                let settings = self.provider.current();
+        match self.provider.current() {
+            Selected::Local(_) => self.orchestrator.run_turn(user_input),
+            Selected::Cloud(cloud) => {
                 let tools: Value = if self.orchestrator.tools_enabled() {
                     serde_json::from_str(lib_rust::tools::TOOLS_JSON).unwrap_or(Value::Null)
                 } else {
                     Value::Null
                 };
-                let generator = provider::openai_generator(
-                    settings.base_url,
-                    settings.api_key,
-                    settings.model,
+                let generator = provider::build_generator(
+                    &cloud,
                     tools,
                     self.orchestrator.temp(),
                     self.orchestrator.n_predict(),
@@ -124,7 +131,7 @@ impl Agent {
                     user_input,
                     "root",
                     true,
-                    &generator,
+                    generator.as_ref(),
                 )
             }
         }
@@ -132,63 +139,86 @@ impl Agent {
 
     /// Resume do provider atual para a TUI/banner.
     pub fn provider_summary(&self) -> String {
-        self.provider.current().summary()
+        self.provider.summary()
     }
 
-    /// Troca o provider do root. Com OpenAi: exige API key (env ou config) e,
-    /// se nao houver modelo definido, adota o primeiro id de `/models`.
-    pub fn switch_provider(&self, kind: ProviderKind) -> Result<String, String> {
-        match kind {
-            ProviderKind::Local => {
-                self.provider.set_kind(ProviderKind::Local);
-                Ok(format!("provider: {}", self.provider_summary()))
-            }
-            ProviderKind::OpenAi => {
-                let settings = self.provider.current();
-                if settings.api_key.is_none() {
-                    return Err(
-                        "OpenAI API sem chave: defina OPENAI_API_KEY (env) ou openai_api_key \
-                         no config.json antes de usar o provider 'openai'."
-                            .to_string(),
-                    );
-                }
-                self.provider.set_kind(ProviderKind::OpenAi);
-                if settings.model.is_empty() {
-                    let models =
-                        provider::list_models(&settings.base_url, settings.api_key.as_deref())?;
-                    let picked = provider::pick_chat_model(&models)
-                        .ok_or_else(|| "endpoint nao listou modelos de chat".to_string())?;
-                    self.provider.set_openai(None, picked.clone());
-                    Ok(format!(
-                        "provider: openai (modelo '{}' adotado de /models)\n{}",
-                        picked,
-                        models.join("\n")
-                    ))
-                } else {
-                    Ok(format!("provider: openai ({})", self.provider_summary()))
-                }
+    /// Troca o provider ativo pelo uuid. Se o cloud escolhido nao tiver modelo,
+    /// adota o primeiro id de `/models`.
+    pub fn switch_provider(&self, uuid: String) -> Result<String, String> {
+        self.provider.select(&uuid)?;
+        if let Some(cloud) = self.provider.selected_cloud() {
+            if cloud.model.trim().is_empty() {
+                let models = provider::list_models(&cloud)?;
+                let picked = provider::pick_chat_model(&models)
+                    .ok_or_else(|| "endpoint nao listou modelos de chat".to_string())?;
+                self.provider
+                    .set_model_and_effort(picked.clone(), cloud.reasoning_effort.clone())?;
+                return Ok(format!(
+                    "{} (modelo '{}' adotado de /models)\n{}",
+                    self.provider_summary(),
+                    picked,
+                    models.join("\n")
+                ));
             }
         }
+        Ok(self.provider_summary())
     }
 
-    /// Lista os ids de modelos do endpoint OpenAI-compativel (so valido quando
-    /// o provider atual e `openai`). Retorna texto pronto para a UI.
+    /// Lista os ids de modelos do provider cloud ativo.
+    pub fn remote_models(&self) -> Result<Vec<String>, String> {
+        let cloud = self
+            .provider
+            .selected_cloud()
+            .ok_or_else(|| "o overlay /models so vale com provider cloud (/provider)".to_string())?;
+        provider::list_models(&cloud)
+    }
+
+    /// Define o modelo e a forca do raciocinio do provider cloud, persistindo.
+    pub fn set_model_and_effort(
+        &self,
+        model: String,
+        reasoning_effort: String,
+    ) -> Result<String, String> {
+        self.provider.set_model_and_effort(model, reasoning_effort)?;
+        Ok(self.provider_summary())
+    }
+
+    /// Constroi o engine local com o modelo e mmproj indicados e o instala
+    /// no AgentManager (se ainda nao estiver rodando). Tambem persiste no
+    /// config.json. Retorna (modelo, has_thinking).
+    pub fn set_local_model(
+        &self,
+        model: String,
+        mmproj: String,
+        params: &crate::EngineParams,
+    ) -> Result<(String, bool), String> {
+        let mut engine = crate::build_runtime(&model, &mmproj, params)?;
+        if self.orchestrator.tools_enabled() {
+            engine
+                .set_tools_json(lib_rust::tools::TOOLS_JSON)
+                .map_err(|err| err.to_string())?;
+        }
+        let has_thinking = engine.supports_thinking().unwrap_or(false);
+        let engine = std::sync::Arc::new(std::sync::Mutex::new(engine));
+        self.orchestrator.manager().install_engine(engine);
+        self.provider.set_local_model(model.clone(), mmproj)?;
+        Ok((model, has_thinking))
+    }
+
+    /// Lista os modelos do provider cloud ativo em texto para a UI.
     pub fn list_models_remote(&self) -> Result<String, String> {
-        let settings = self.provider.current();
-        if settings.kind != ProviderKind::OpenAi {
-            return Err(
-                "o endpoint de modelos so existe com provider 'openai' (use /provider openai)"
-                    .to_string(),
-            );
-        }
-        let models = provider::list_models(&settings.base_url, settings.api_key.as_deref())?;
+        let cloud = self
+            .provider
+            .selected_cloud()
+            .ok_or_else(|| "o overlay /models so vale com provider cloud".to_string())?;
+        let models = provider::list_models(&cloud)?;
         Ok(format!(
             "Modelos em {}\n\n{}",
-            settings.base_url,
+            cloud.base_url,
             models
                 .iter()
                 .map(|m| {
-                    if *m == settings.model {
+                    if *m == cloud.model {
                         format!("  * {} (atual)", m)
                     } else {
                         format!("  {}", m)
@@ -202,19 +232,24 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    use crate::config;
     use super::*;
 
-    fn temp_config(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn temp_config(tag: &str, cloud: bool) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("drill-test-{}-{}", std::process::id(), tag));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        std::fs::write(
-            &path,
-            r#"{"model":"","tools":true,"provider":"local",
-               "openai_base_url":"https://api.groq.com/openai/v1",
-               "openai_model":"","openai_api_key":""}"#,
-        )
-        .unwrap();
+        let text = if cloud {
+            r#"{"model":"","tools":true,"providers":{"local":[],
+               "cloud":[{"id":"c1","name":"groq","type-url":"openai",
+                 "base_url":"https://api.groq.com/openai/v1","model":"",
+                 "router":"/chat/completions","api_key":"","reasoning_effort":"medium","ctx":8192}]},
+               "provider-selected-uuid":"c1"}"#
+        } else {
+            r#"{"model":"","tools":true,"providers":{"local":[],"cloud":[]},
+               "provider-selected-uuid":null}"#
+        };
+        std::fs::write(&path, text).unwrap();
         (dir, path)
     }
 
@@ -236,9 +271,9 @@ mod tests {
 
     #[test]
     fn provider_local_default_and_summary() {
-        let (dir, path) = temp_config("local");
+        let (dir, path) = temp_config("local", false);
         let agent = make_agent(&path, &dir);
-        assert_eq!(provider::ProviderKind::Local, agent.provider.kind());
+        assert!(!agent.provider.is_cloud());
         assert!(agent.provider_summary().contains("local"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -251,19 +286,16 @@ mod tests {
             eprintln!("pulando: OPENAI_API_KEY nao definida");
             return;
         }
-        let (dir, path) = temp_config("groq");
+        let (dir, path) = temp_config("groq", true);
         let agent = make_agent(&path, &dir);
-        let msg = agent.switch_provider(provider::ProviderKind::OpenAi).unwrap();
-        assert!(msg.contains("provider: openai"), "msg={}", msg);
-        let cur = agent.provider.current();
-        assert!(
-            !cur.model.is_empty(),
-            "modelo deveria ser adotado de /models"
-        );
-        assert!(cur.base_url.contains("groq.com"));
+        let msg = agent.switch_provider("c1".to_string()).unwrap();
+        assert!(msg.contains("groq") || msg.contains("openai"), "msg={}", msg);
+        let cloud = agent.provider.selected_cloud().unwrap();
+        assert!(!cloud.model.is_empty(), "modelo deveria ser adotado de /models");
+        assert!(cloud.base_url.contains("groq.com"));
         let cfg = config::load_or_create(&path).0;
-        assert_eq!(cfg.provider, provider::ProviderKind::OpenAi.label());
-        assert_eq!(cfg.openai_model, cur.model);
+        assert_eq!(cfg.provider_selected_uuid.as_deref(), Some("c1"));
+        assert_eq!(cfg.providers.cloud[0].model, cloud.model);
         let listing = agent.list_models_remote().unwrap();
         assert!(listing.contains("Modelos em"), "listing={}", listing);
         let _ = std::fs::remove_dir_all(&dir);

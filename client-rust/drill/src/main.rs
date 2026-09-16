@@ -19,6 +19,7 @@ pub use config::DEFAULT_MODEL;
 
 struct Cli {
     model: Option<String>,
+    mmproj: Option<String>,
     ngl: Option<usize>,
     ctx: Option<usize>,
     n_predict: Option<usize>,
@@ -35,6 +36,7 @@ impl Cli {
     fn parse() -> Self {
         let mut cli = Cli {
             model: None,
+            mmproj: None,
             ngl: None,
             ctx: None,
             n_predict: None,
@@ -63,6 +65,11 @@ impl Cli {
                 "--model" => {
                     if let Some(v) = next(&mut args, &mut i) {
                         cli.model = Some(v);
+                    }
+                }
+                "--mmproj" => {
+                    if let Some(v) = next(&mut args, &mut i) {
+                        cli.mmproj = Some(v);
                     }
                 }
                 "--ngl" => {
@@ -116,6 +123,7 @@ impl Cli {
                         "drill — agente de codigo para LLMs GGUF\n\n\
                          Uso: drill [opcoes]\n\n\
                          --model <path>    modelo GGUF (default: ver ~/.drill/config.json)\n\
+                         --mmproj <path>   projecao multi-modal (llava/qwen2vl; opcional)\n\
                          --ngl <n>         camadas GPU (default 999)\n\
                          --ctx <n>         contexto (default 8192)\n\
                          --n-predict <n>   tokens por turno (default 1024)\n\
@@ -146,6 +154,7 @@ impl Cli {
 
 struct Effective {
     model: String,
+    mmproj: String,
     ngl: usize,
     ctx: usize,
     n_predict: usize,
@@ -162,49 +171,60 @@ struct Effective {
     cache_type_k: String,
     cache_type_v: String,
     config_path: String,
+    /// Provider ativo e remoto (cloud): sem modelo local obrigatorio.
+    remote_only: bool,
 }
 
 fn resolve(cli: Cli) -> Effective {
     let cfg_path = config::config_path();
-    let config::DrillConfig {
-        model,
-        tools,
-        ngl,
-        ctx,
-        n_predict,
-        temp,
-        spec,
-        persona,
-        dir,
-        threads,
-        threads_batch,
-        flash_attn,
-        cache_type_k,
-        cache_type_v,
-        ..
-    } = config::load_or_create(&cfg_path).0;
+    let cfg = config::load_or_create(&cfg_path).0;
+
+    let selected_local = cfg
+        .providers
+        .local
+        .iter()
+        .find(|p| Some(&p.id) == cfg.provider_selected_uuid.as_ref())
+        .or_else(|| cfg.providers.local.first())
+        .cloned();
+    let remote_only = cfg
+        .provider_selected_uuid
+        .as_ref()
+        .map(|id| cfg.providers.cloud.iter().any(|p| &p.id == id))
+        .unwrap_or(false);
+
+    let fallback = config::LocalProvider {
+        model: if cfg.model.trim().is_empty() {
+            config::DEFAULT_MODEL.to_string()
+        } else {
+            cfg.model.clone()
+        },
+        ..config::LocalProvider::default()
+    };
+    let local = selected_local.unwrap_or(fallback);
 
     Effective {
-        model: cli.model.clone().unwrap_or(model),
-        ngl: cli.ngl.unwrap_or(ngl),
-        ctx: cli.ctx.unwrap_or(ctx),
-        n_predict: cli.n_predict.unwrap_or(n_predict),
-        temp: cli.temp.unwrap_or(temp),
-        spec: cli.spec.unwrap_or(spec),
-        tools: cli.tools.unwrap_or(tools),
+        model: cli.model.clone().unwrap_or(local.model),
+        mmproj: cli.mmproj.clone().unwrap_or(local.mmproj),
+        ngl: cli.ngl.unwrap_or(local.ngl),
+        ctx: cli.ctx.unwrap_or(local.ctx),
+        n_predict: cli.n_predict.unwrap_or(local.n_predict),
+        temp: cli.temp.unwrap_or(local.temp),
+        spec: cli.spec.unwrap_or(local.spec),
+        tools: cli.tools.unwrap_or(cfg.tools),
         dir: cli
             .dir
-            .or_else(|| dir.map(PathBuf::from))
+            .or_else(|| cfg.dir.clone().map(PathBuf::from))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        persona: cli.persona.clone().unwrap_or(persona),
+        persona: cli.persona.clone().unwrap_or(cfg.persona),
         headless: cli.headless.clone(),
         mode: cli.mode.clone().unwrap_or_else(|| "solo".to_string()),
-        threads,
-        threads_batch,
-        flash_attn,
-        cache_type_k,
-        cache_type_v,
+        threads: cfg.threads,
+        threads_batch: cfg.threads_batch,
+        flash_attn: cfg.flash_attn,
+        cache_type_k: cfg.cache_type_k,
+        cache_type_v: cfg.cache_type_v,
         config_path: cfg_path.display().to_string(),
+        remote_only,
     }
 }
 
@@ -212,19 +232,35 @@ fn main() {
     let eff = resolve(Cli::parse());
     let cfg = config::load_or_create(std::path::Path::new(&eff.config_path)).0;
 
-    let remote_only = cfg.provider == config::DEFAULT_PROVIDER_OPENAI;
-    let mut engine = match build_engine(&eff) {
-        Ok(engine) => Some(engine),
-        Err(err) => {
-            if remote_only {
-                eprintln!(
-                    "[drill] provider remoto ativo; sem modelo local, seguindo sem RuntimeLlama: {}",
-                    err
-                );
-                None
-            } else {
-                eprintln!("falha ao iniciar runtime: {}", err);
-                std::process::exit(1);
+    let remote_only = eff.remote_only;
+    // TUI + provider local com arquivo ausente (ou mmproj apontando para um
+    // arquivo inexistente): nao aborta — o modal pede o caminho no boot.
+    let setup_tui = !remote_only
+        && eff.headless.is_none()
+        && (eff.model.trim().is_empty()
+            || !std::path::Path::new(&eff.model).exists()
+            || (!eff.mmproj.trim().is_empty() && !std::path::Path::new(eff.mmproj.trim()).exists()));
+
+    let mut engine = if setup_tui {
+        eprintln!(
+            "[drill] modelo local nao encontrado: {} — o TUI vai pedir o caminho do GGUF",
+            eff.model
+        );
+        None
+    } else {
+        match build_engine(&eff) {
+            Ok(engine) => Some(engine),
+            Err(err) => {
+                if remote_only {
+                    eprintln!(
+                        "[drill] provider remoto ativo; sem modelo local, seguindo sem RuntimeLlama: {}",
+                        err
+                    );
+                    None
+                } else {
+                    eprintln!("falha ao iniciar runtime: {}", err);
+                    std::process::exit(1);
+                }
             }
         }
     };
@@ -238,8 +274,14 @@ fn main() {
         }
     }
 
-    println!("[drill] carregando modelo... aguarde;\n  {} ({} camadas GPU, tools {}, config {})",
-             eff.model, eff.ngl, if eff.tools { "on" } else { "off" }, eff.config_path);
+    if engine.is_some() {
+        println!("[drill] carregando modelo... aguarde;\n  {} ({} camadas GPU, tools {}, config {})",
+                 eff.model, eff.ngl, if eff.tools { "on" } else { "off" }, eff.config_path);
+    } else {
+        eprintln!(
+            "[drill] runtime local nao iniciado no boot (modelo ausente ou provider remoto)."
+        );
+    }
 
     let has_thinking = engine
         .as_mut()
@@ -298,6 +340,17 @@ fn main() {
                 if has_thinking { "on" } else { "off" }, agent.provider_summary(), eff.config_path),
     );
 
+    if setup_tui {
+        state.push(
+            tui::Kind::Err,
+            format!(
+                "modelo GGUF nao encontrado: {} — informe o caminho no modal abaixo.",
+                eff.model
+            ),
+        );
+        state.open_model_setup(eff.model.clone(), eff.mmproj.clone());
+    }
+
     // Canal de permissao: tools sensiveis (ex.: fetch_url) bloqueiam a thread
     // de geracao ate o usuario responder aqui.
     let permission_rx = tools::install_permission_channel();
@@ -330,7 +383,14 @@ fn main() {
     let (ev_tx, ev_rx) = channel::<tui::UiEvent>();
     let (turn_tx, turn_rx) = channel::<agent::WorkerMsg>();
 
-    thread::spawn(move || worker(&mut agent, turn_rx, ev_tx));
+    // Snapshot inicial dos providers para o overlay `/provider`.
+    {
+        let (entries, selected) = provider_store.snapshot();
+        let _ = ev_tx.send(tui::UiEvent::Providers { entries, selected });
+    }
+
+    let engine_params = EngineParams::from_eff(&eff);
+    thread::spawn(move || worker(&mut agent, turn_rx, ev_tx, engine_params));
 
     if let Err(err) = tui::run(state, ev_rx, turn_tx, history, session_id, permission_rx) {
         eprintln!("tui error: {}", err);
@@ -364,26 +424,77 @@ fn run_headless(agent: &mut Agent, prompt: &str) {
     }
 }
 
+/// Parametros de runtime locais compartilhados entre o boot (build_engine) e o
+/// worker (SetLocalModel), quando o modelo e configurado via modal depois.
+pub(crate) struct EngineParams {
+    pub ngl: usize,
+    pub ctx: usize,
+    pub n_predict: usize,
+    pub temp: f32,
+    pub spec: String,
+    pub threads: i64,
+    pub threads_batch: i64,
+    pub flash_attn: String,
+    pub cache_type_k: String,
+    pub cache_type_v: String,
+}
+
+impl EngineParams {
+    fn from_eff(eff: &Effective) -> Self {
+        Self {
+            ngl: eff.ngl,
+            ctx: eff.ctx,
+            n_predict: eff.n_predict,
+            temp: eff.temp,
+            spec: eff.spec.clone(),
+            threads: eff.threads,
+            threads_batch: eff.threads_batch,
+            flash_attn: eff.flash_attn.clone(),
+            cache_type_k: eff.cache_type_k.clone(),
+            cache_type_v: eff.cache_type_v.clone(),
+        }
+    }
+}
+
 fn build_engine(eff: &Effective) -> Result<RuntimeLlama, String> {
-    let model_path = std::path::Path::new(&eff.model);
+    build_runtime(&eff.model, &eff.mmproj, &EngineParams::from_eff(eff))
+}
+
+/// Constroi um `RuntimeLlama` para o modelo GGUF (com mmproj opcional). Usado
+/// tanto no boot quanto no worker quando o modelo e definido pelo modal.
+pub(crate) fn build_runtime(
+    model: &str,
+    mmproj: &str,
+    p: &EngineParams,
+) -> Result<RuntimeLlama, String> {
+    let model_path = std::path::Path::new(model);
     if !model_path.exists() {
         return Err(format!(
             "modelo nao encontrado: {} — verifique o caminho no config.json (ou use --model)",
-            eff.model
+            model
         ));
     }
+    let mmproj = mmproj.trim();
+    if !mmproj.is_empty() && !std::path::Path::new(mmproj).exists() {
+        return Err(format!("arquivo mmproj nao encontrado: {}", mmproj));
+    }
+    let mmproj_opt = if mmproj.is_empty() {
+        None
+    } else {
+        Some(mmproj.to_string())
+    };
     let mut engine = RuntimeLlama::try_new(
-        eff.model.clone(),
-        eff.ctx,
-        eff.n_predict,
+        model.to_string(),
+        p.ctx,
+        p.n_predict,
         128,
         128,
-        eff.temp,
+        p.temp,
         0.95,
         40,
+        mmproj_opt,
         None,
-        None,
-        Some(eff.ngl),
+        Some(p.ngl),
         None, // system prompt vem do historico de cada agente (sem excecao nativa)
     )
         .map_err(|err| err.to_string())?;
@@ -392,23 +503,23 @@ fn build_engine(eff: &Effective) -> Result<RuntimeLlama, String> {
     engine.set_enable_reasoning(1).map_err(|err| err.to_string())?;
 
     for (prop, value) in [
-        ("cache-type-k", &eff.cache_type_k),
-        ("cache-type-v", &eff.cache_type_v),
+        ("cache-type-k", &p.cache_type_k),
+        ("cache-type-v", &p.cache_type_v),
     ] {
         engine.set_string_prop(prop, value).map_err(|err| err.to_string())?;
     }
-    engine.set_int_prop("threads", eff.threads).map_err(|err| err.to_string())?;
-    engine.set_int_prop("threads-batch", eff.threads_batch).map_err(|err| err.to_string())?;
+    engine.set_int_prop("threads", p.threads).map_err(|err| err.to_string())?;
+    engine.set_int_prop("threads-batch", p.threads_batch).map_err(|err| err.to_string())?;
     engine
-        .set_string_prop("flash-attn", &eff.flash_attn)
+        .set_string_prop("flash-attn", &p.flash_attn)
         .map_err(|err| err.to_string())?;
 
-    if eff.spec == "draft-mtp" {
+    if p.spec == "draft-mtp" {
         engine.set_speculative_type("draft-mtp").map_err(|err| err.to_string())?;
         engine.set_spec_draft_ngl(999).map_err(|err| err.to_string())?;
         engine.set_spec_draft_backend_sampling(false).map_err(|err| err.to_string())?;
         for prop in ["n-gpu-layers-draft", "spec-draft-ngl"] {
-            engine.set_int_prop(prop, eff.ngl as i64).map_err(|err| err.to_string())?;
+            engine.set_int_prop(prop, p.ngl as i64).map_err(|err| err.to_string())?;
         }
         engine.set_string_prop("spec-draft-device", "Vulkan0").map_err(|err| err.to_string())?;
     } else {
@@ -420,7 +531,12 @@ fn build_engine(eff: &Effective) -> Result<RuntimeLlama, String> {
     Ok(engine)
 }
 
-fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<tui::UiEvent>) {
+fn worker(
+    agent: &mut Agent,
+    turns: Receiver<agent::WorkerMsg>,
+    events: Sender<tui::UiEvent>,
+    engine_params: EngineParams,
+) {
     let send = |event: tui::UiEvent| {
         let _ = events.send(event);
     };
@@ -450,6 +566,7 @@ fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<t
 
     while let Ok(msg) = turns.recv() {
         let input = match msg {
+
             agent::WorkerMsg::SetMode(mode) => {
                 agent.set_mode(mode);
                 send(tui::UiEvent::ModeChanged(mode));
@@ -459,17 +576,75 @@ fn worker(agent: &mut Agent, turns: Receiver<agent::WorkerMsg>, events: Sender<t
                 agent.set_session(id);
                 continue;
             }
-            agent::WorkerMsg::SetProvider(kind) => {
-                match agent.switch_provider(kind) {
+            agent::WorkerMsg::SetProvider(uuid) => {
+                match agent.switch_provider(uuid) {
                     Ok(summary) => send(tui::UiEvent::Muted(format!("[provider] {}", summary))),
+                    Err(err) => send(tui::UiEvent::Err(err)),
+                }
+                let (entries, selected) = agent.provider.snapshot();
+                send(tui::UiEvent::Providers { entries, selected });
+                continue;
+            }
+            agent::WorkerMsg::ListModels => {
+                match agent.remote_models() {
+                    Ok(models) => {
+                        let cloud = agent.provider.selected_cloud();
+                        let (current, effort) = cloud
+                            .map(|c| (c.model, c.reasoning_effort))
+                            .unwrap_or_default();
+                        send(tui::UiEvent::Models {
+                            models,
+                            current,
+                            effort,
+                        });
+                    }
                     Err(err) => send(tui::UiEvent::Err(err)),
                 }
                 continue;
             }
-            agent::WorkerMsg::ListModels => {
-                match agent.list_models_remote() {
-                    Ok(list) => send(tui::UiEvent::Muted(format!("[models]\n{}", list))),
+            agent::WorkerMsg::SetModelAndEffort(model, effort) => {
+                match agent.set_model_and_effort(model, effort) {
+                    Ok(summary) => send(tui::UiEvent::Muted(format!("[provider] {}", summary))),
                     Err(err) => send(tui::UiEvent::Err(err)),
+                }
+                let (entries, selected) = agent.provider.snapshot();
+                send(tui::UiEvent::Providers { entries, selected });
+                continue;
+            }
+            agent::WorkerMsg::AddCloudProvider {
+                kind,
+                base_url,
+                model,
+                api_key,
+            } => {
+                match agent.provider.add_cloud(kind, base_url, model, api_key) {
+                    Ok(summary) => {
+                        send(tui::UiEvent::Muted(format!("[provider] adicionado: {}", summary)));
+                    }
+                    Err(err) => send(tui::UiEvent::Err(err)),
+                }
+                let (entries, selected) = agent.provider.snapshot();
+                send(tui::UiEvent::Providers { entries, selected });
+                continue;
+            }
+            agent::WorkerMsg::SetLocalModel { model, mmproj } => {
+                // Constroi o engine local com o caminho informado no modal e o
+                // instala na fila (se ainda nao estava rodando).
+                match agent.set_local_model(model, mmproj, &engine_params) {
+                    Ok((model, has_thinking)) => {
+                        send(tui::UiEvent::Muted(format!(
+                            "[modelo] local configurado: {} (raciocinio {})",
+                            model,
+                            if has_thinking { "on" } else { "off" }
+                        )));
+                        send(tui::UiEvent::ModelReady {
+                            model,
+                            thinking: has_thinking,
+                        });
+                        let (entries, selected) = agent.provider.snapshot();
+                        send(tui::UiEvent::Providers { entries, selected });
+                    }
+                    Err(err) => send(tui::UiEvent::Err(format!("[modelo] {}", err))),
                 }
                 continue;
             }

@@ -62,7 +62,7 @@ pub struct AgentManager {
     states: Arc<Mutex<HashMap<String, AgentState>>>,
     queue_tx: Sender<AgentTask>,
     queue_rx: Mutex<Option<Receiver<AgentTask>>>,
-    engine: Mutex<Option<Arc<Mutex<RuntimeLlama>>>>,
+    engine: Arc<Mutex<Option<Arc<Mutex<RuntimeLlama>>>>>,
     executor: Arc<Mutex<Option<ToolExecutor>>>,
     events: Arc<Mutex<Option<EventSink>>>,
     interrupt: Arc<AtomicBool>,
@@ -79,7 +79,7 @@ impl AgentManager {
             states: Arc::new(Mutex::new(HashMap::new())),
             queue_tx: tx,
             queue_rx: Mutex::new(Some(rx)),
-            engine: Mutex::new(None),
+            engine: Arc::new(Mutex::new(None)),
             executor: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(None)),
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -191,14 +191,20 @@ impl AgentManager {
         rx.recv().map_err(|err| err.to_string())?
     }
 
+    /// Inicia a fila/thread de execucao com um engine local. Idempotente: se a
+    /// fila ja esta rodando, apenas troca o engine em uso (proximo turno usa o
+    /// novo) — permite recarregar o modelo via /model sem reiniciar.
     pub fn run(&self, engine: Arc<Mutex<RuntimeLlama>>) {
-        let rx = self
-            .queue_rx
-            .lock()
-            .unwrap()
-            .take()
-            .expect("AgentManager já está rodando");
-        *self.engine.lock().unwrap() = Some(engine.clone());
+        let rx = {
+            let mut guard = self.queue_rx.lock().unwrap();
+            if guard.is_none() {
+                *self.engine.lock().unwrap() = Some(engine);
+                return;
+            }
+            guard.take().expect("AgentManager já está rodando")
+        };
+        *self.engine.lock().unwrap() = Some(engine);
+        let engine_holder = Arc::clone(&self.engine);
         let states = Arc::clone(&self.states);
         let executor = Arc::clone(&self.executor);
         let events = Arc::clone(&self.events);
@@ -209,6 +215,12 @@ impl AgentManager {
 
         thread::spawn(move || {
             while let Ok(task) = rx.recv() {
+                let engine = engine_holder.lock().unwrap().clone();
+                let Some(engine) = engine else {
+                    let _ = task.reply.send(Err("runtime local nao iniciado".to_string()));
+                    continue;
+                };
+
                 let mut state = {
                     let map = states.lock().unwrap();
                     map.get(&task.agent_id).cloned()
@@ -241,6 +253,12 @@ impl AgentManager {
                 let _ = task.reply.send(result);
             }
         });
+    }
+
+    /// Instala um engine local: inicia a fila se ainda nao rodava (boot sem
+    /// GGUF), ou troca o engine em uso quando o modelo e recarregado (/model).
+    pub fn install_engine(&self, engine: Arc<Mutex<RuntimeLlama>>) {
+        self.run(engine);
     }
 
     /// Executa um agente inline NA MESMA THREAD do chamador — usado por
